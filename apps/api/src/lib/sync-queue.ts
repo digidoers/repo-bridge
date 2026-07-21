@@ -36,6 +36,39 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function parseUnifiedDiff(diffOutput: string): Map<string, string> {
+  const filePatches = new Map<string, string>();
+  const parts = diffOutput.split(/^diff --git /gm);
+
+  for (const part of parts) {
+    if (!part.trim()) continue;
+
+    const firstNewline = part.indexOf("\n");
+    if (firstNewline === -1) continue;
+    const headerLine = part.substring(0, firstNewline).trim();
+
+    let filePath = "";
+    const quotedMatch = headerLine.match(/^"a\/(.+?)" "b\/.+$/);
+    if (quotedMatch) {
+      filePath = quotedMatch[1];
+      try {
+        filePath = JSON.parse(`"${filePath}"`);
+      } catch (e) {}
+    } else {
+      const unquotedMatch = headerLine.match(/^a\/(.+?) b\/.+$/);
+      if (unquotedMatch) {
+        filePath = unquotedMatch[1];
+      }
+    }
+
+    if (filePath) {
+      filePatches.set(filePath, "diff --git " + part);
+    }
+  }
+
+  return filePatches;
+}
+
 type ApplyOptions = {
   autoMerge?: boolean;
 };
@@ -160,48 +193,73 @@ class SyncQueue {
           });
         }
 
-        // Populate or update the PushFile records for this pushEvent
-        for (const filePath of selectedPaths) {
-          try {
-            const filePatch = runGit(["diff", "--binary", "HEAD", job.pushEvent.commitSha, "--", filePath], targetDir);
-            let additions = 0;
-            let deletions = 0;
-            const lines = filePatch.split("\n");
-            for (const line of lines) {
-              if (line.startsWith("+") && !line.startsWith("+++")) additions++;
-              if (line.startsWith("-") && !line.startsWith("---")) deletions++;
+        if (selectedPaths.length > 0) {
+          // Bulk get stats and patches in single git commands instead of spawning for each file
+          const numstatOutput = runGit(["diff", "--numstat", "HEAD", job.pushEvent.commitSha], targetDir);
+          const statsMap = new Map<string, { additions: number; deletions: number }>();
+          const lines = numstatOutput.split("\n");
+          for (const line of lines) {
+            const parts = line.trim().split(/\s+/);
+            if (parts.length >= 3) {
+              const additions = parts[0] === "-" ? 0 : parseInt(parts[0], 10) || 0;
+              const deletions = parts[1] === "-" ? 0 : parseInt(parts[1], 10) || 0;
+              const filePath = parts.slice(2).join(" ");
+              statsMap.set(filePath, { additions, deletions });
             }
+          }
 
-            const existingPushFile = await prisma.pushFile.findFirst({
-              where: {
-                pushEventId: job.pushEventId,
-                filePath
-              }
-            });
+          const fullDiffOutput = runGit(["diff", "--binary", "HEAD", job.pushEvent.commitSha], targetDir);
+          const patchesMap = parseUnifiedDiff(fullDiffOutput);
 
-            if (existingPushFile) {
-              await prisma.pushFile.update({
-                where: { id: existingPushFile.id },
-                data: {
-                  patch: filePatch,
-                  additions,
-                  deletions,
-                }
-              });
+          // Get existing push files to decide whether to update or create
+          const existingPushFiles = await prisma.pushFile.findMany({
+            where: {
+              pushEventId: job.pushEventId,
+              filePath: { in: selectedPaths }
+            }
+          });
+          const existingPushFilesMap = new Map(existingPushFiles.map(pf => [pf.filePath, pf.id]));
+
+          const pushFileOperations = [];
+          for (const filePath of selectedPaths) {
+            const stats = statsMap.get(filePath) || { additions: 0, deletions: 0 };
+            const filePatch = patchesMap.get(filePath) || null;
+            const existingId = existingPushFilesMap.get(filePath);
+
+            if (existingId) {
+              pushFileOperations.push(
+                prisma.pushFile.update({
+                  where: { id: existingId },
+                  data: {
+                    patch: filePatch,
+                    additions: stats.additions,
+                    deletions: stats.deletions,
+                  }
+                })
+              );
             } else {
-              await prisma.pushFile.create({
-                data: {
-                  pushEventId: job.pushEventId,
-                  filePath,
-                  changeType: "modified",
-                  patch: filePatch,
-                  additions,
-                  deletions,
-                }
-              });
+              pushFileOperations.push(
+                prisma.pushFile.create({
+                  data: {
+                    pushEventId: job.pushEventId,
+                    filePath,
+                    changeType: "modified",
+                    patch: filePatch,
+                    additions: stats.additions,
+                    deletions: stats.deletions,
+                  }
+                })
+              );
             }
-          } catch (diffErr) {
-            console.error(`Failed to get diff for file ${filePath}:`, diffErr);
+          }
+
+          // Run push files operations in chunks of 200 via transaction
+          if (pushFileOperations.length > 0) {
+            const chunkSize = 200;
+            for (let i = 0; i < pushFileOperations.length; i += chunkSize) {
+              const chunk = pushFileOperations.slice(i, i + chunkSize);
+              await prisma.$transaction(chunk);
+            }
           }
         }
 
@@ -228,15 +286,18 @@ class SyncQueue {
       // 6. Checkout temporary branch for checking
       runGit(["checkout", "-b", `dry-run-${jobId}`], targetDir);
 
+      // Bulk diff to identify drifted files in target branch compared to baseSha in a single call
+      const driftedFiles = new Set<string>();
+      try {
+        const diffOutput = runGit(["diff", "--name-only", job.pushEvent.baseSha, "HEAD"], targetDir);
+        diffOutput.split("\n").map(f => f.trim()).filter(Boolean).forEach(f => driftedFiles.add(f));
+      } catch (diffErr) {
+        console.error("Failed to run bulk git diff between baseSha and HEAD:", diffErr);
+      }
+
       const mergeResultsByFile = new Map<string, "CLEAN" | "MERGED">();
       for (const jobFile of job.files) {
-        let mergeResult: "CLEAN" | "MERGED" = "CLEAN";
-        try {
-          // Check target branch drift before applying the source patch.
-          runGit(["diff", "--quiet", job.pushEvent.baseSha, "HEAD", "--", jobFile.filePath], targetDir);
-        } catch (diffErr) {
-          mergeResult = "MERGED";
-        }
+        const mergeResult = driftedFiles.has(jobFile.filePath) ? "MERGED" : "CLEAN";
         mergeResultsByFile.set(jobFile.filePath, mergeResult);
       }
 
@@ -248,6 +309,7 @@ class SyncQueue {
       }
 
       let hasConflict = false;
+      const jobFileUpdates = [];
 
       for (const jobFile of job.files) {
         const filePathOnDisk = path.join(targetDir, jobFile.filePath);
@@ -263,10 +325,21 @@ class SyncQueue {
           }
         }
 
-        await prisma.syncJobFile.update({
-          where: { id: jobFile.id },
-          data: { mergeResult, conflictDiff },
-        });
+        jobFileUpdates.push(
+          prisma.syncJobFile.update({
+            where: { id: jobFile.id },
+            data: { mergeResult, conflictDiff },
+          })
+        );
+      }
+
+      // Run database updates in chunks of 200 via transaction
+      if (jobFileUpdates.length > 0) {
+        const chunkSize = 200;
+        for (let i = 0; i < jobFileUpdates.length; i += chunkSize) {
+          const chunk = jobFileUpdates.slice(i, i + chunkSize);
+          await prisma.$transaction(chunk);
+        }
       }
 
       await prisma.syncJob.update({
