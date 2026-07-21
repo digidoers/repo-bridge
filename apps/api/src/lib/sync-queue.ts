@@ -69,6 +69,24 @@ function parseUnifiedDiff(diffOutput: string): Map<string, string> {
   return filePatches;
 }
 
+function getSafeSelectedPaths(job: any, selectedPaths: string[], targetDir: string): string[] {
+  const baseShaFiles = new Set<string>();
+  if (job.pushEvent.baseSha !== "HEAD") {
+    try {
+      const lsOutput = runGit(["ls-tree", "-r", "--name-only", job.pushEvent.baseSha], targetDir);
+      lsOutput.split("\n").map(f => f.trim()).filter(Boolean).forEach(f => baseShaFiles.add(f));
+    } catch (lsErr) {
+      console.error("Failed to run git ls-tree:", lsErr);
+    }
+  }
+
+  return selectedPaths.filter(filePath => {
+    const existedInBase = baseShaFiles.has(filePath);
+    const existsInTarget = fs.existsSync(path.join(targetDir, filePath));
+    return !existedInBase || existsInTarget;
+  });
+}
+
 type ApplyOptions = {
   autoMerge?: boolean;
 };
@@ -280,7 +298,11 @@ class SyncQueue {
       }
 
       const patchFile = path.join(tempDir, "selected.patch");
-      const selectedPatch = runGit(["diff", "--binary", job.pushEvent.baseSha, job.pushEvent.commitSha, "--", ...selectedPaths], targetDir);
+      const safePaths = getSafeSelectedPaths(job, selectedPaths, targetDir);
+      let selectedPatch = "";
+      if (safePaths.length > 0) {
+        selectedPatch = runGit(["diff", "--binary", job.pushEvent.baseSha, job.pushEvent.commitSha, "--", ...safePaths], targetDir);
+      }
       fs.writeFileSync(patchFile, selectedPatch);
 
       // 6. Checkout temporary branch for checking
@@ -709,7 +731,11 @@ class SyncQueue {
       // 5. Build patch file for selected files only
       const patchFile = path.join(tempDir, "selected.patch");
       const selectedPaths = job.files.map((f: any) => f.filePath);
-      const selectedPatch = runGit(["diff", "--binary", job.pushEvent.baseSha, job.pushEvent.commitSha, "--", ...selectedPaths], targetDir);
+      const safePaths = getSafeSelectedPaths(job, selectedPaths, targetDir);
+      let selectedPatch = "";
+      if (safePaths.length > 0) {
+        selectedPatch = runGit(["diff", "--binary", job.pushEvent.baseSha, job.pushEvent.commitSha, "--", ...safePaths], targetDir);
+      }
       fs.writeFileSync(patchFile, selectedPatch);
 
       if (selectedPatch.trim().length === 0) {
