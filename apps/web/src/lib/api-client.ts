@@ -187,6 +187,36 @@ class ApiClient {
     return this.request<GithubCommitDetail>(`/repos/${repoId}/commits/${sha}/files`);
   }
 
+  async compareRepoCommits(
+    repoId: string,
+    base: string,
+    head: string
+  ): Promise<{
+    baseSha: string;
+    headSha: string;
+    commits: Array<{ sha: string; message: string; authorName: string; date: string }>;
+    files: Array<{
+      filename: string;
+      status: string;
+      patch?: string;
+      additions: number;
+      deletions: number;
+    }>;
+  }> {
+    return this.request<{
+      baseSha: string;
+      headSha: string;
+      commits: Array<{ sha: string; message: string; authorName: string; date: string }>;
+      files: Array<{
+        filename: string;
+        status: string;
+        patch?: string;
+        additions: number;
+        deletions: number;
+      }>;
+    }>(`/repos/${repoId}/compare?base=${encodeURIComponent(base)}&head=${encodeURIComponent(head)}`);
+  }
+
   async createManualSync(data: ManualSyncRequest): Promise<ManualSyncResponse> {
     return this.request<ManualSyncResponse>("/manual-sync", {
       method: "POST",

@@ -65,6 +65,8 @@ export interface CursorPaginatedResponse<T> {
   pageSize: number;
   hasNextPage: boolean;
   hasPreviousPage: boolean;
+  total?: number;
+  totalPages?: number;
 }
 
 // ─────────────────────────────────────────────────────────
@@ -200,6 +202,9 @@ export interface ManualSyncRequest {
   commitSha?: string;
   commitShas?: string[];
   filePaths: string[];
+  syncMode?: "commits" | "branch";
+  baseBranch?: string;
+  compareBranch?: string;
 }
 
 export interface ManualSyncResponse {

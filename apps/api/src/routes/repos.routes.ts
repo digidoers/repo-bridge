@@ -348,7 +348,7 @@ reposRouter.get(
       }
 
       const page = Math.max(1, Number(req.query.page || 1));
-      const pageSize = Math.min(50, Math.max(10, Number(req.query.pageSize || 20)));
+      const pageSize = Math.min(100, Math.max(10, Number(req.query.pageSize || 20)));
       const search = typeof req.query.search === "string" ? req.query.search : undefined;
 
       const commits = await GithubAppService.listCommits(
@@ -387,6 +387,42 @@ reposRouter.get(
       );
 
       res.json({ ok: true, data: commit });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// ─────────────────────────────────────────────────────────
+// GET /repos/:id/compare?base=<base>&head=<head>
+// ─────────────────────────────────────────────────────────
+reposRouter.get(
+  "/:id/compare",
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const repo = await prisma.repository.findUnique({
+        where: { id: req.params.id as string },
+      });
+
+      if (!repo || repo.userId !== req.user!.id) {
+        throw AppError.notFound("Repository not found");
+      }
+
+      const base = req.query.base as string;
+      const head = req.query.head as string;
+
+      if (!base || !head) {
+        throw AppError.badRequest("base and head query parameters are required");
+      }
+
+      const comparison = await GithubAppService.compareCommits(
+        repo.installationId,
+        repo.fullName,
+        base,
+        head
+      );
+
+      res.json({ ok: true, data: comparison });
     } catch (err) {
       next(err);
     }

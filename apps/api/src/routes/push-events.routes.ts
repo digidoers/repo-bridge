@@ -149,52 +149,54 @@ pushEventsRouter.get("/:id", async (req: Request, res: Response, next: NextFunct
       }>;
     }> = [];
 
-    try {
-      const selectedFilePaths = new Set(pushEvent.files.map((file) => file.filePath));
-      const branchCommitsResult = await GithubAppService.listCommits(
-        pushEvent.repository.installationId,
-        pushEvent.repository.fullName,
-        pushEvent.branch,
-        { pageSize: 50 }
-      );
-      const branchCommits = branchCommitsResult.items;
-      const headIndex = branchCommits.findIndex((commit) => commit.sha === pushEvent.commitSha);
+    if (pushEvent.baseSha !== "HEAD") {
+      try {
+        const selectedFilePaths = new Set(pushEvent.files.map((file) => file.filePath));
+        const branchCommitsResult = await GithubAppService.listCommits(
+          pushEvent.repository.installationId,
+          pushEvent.repository.fullName,
+          pushEvent.branch,
+          { pageSize: 50 }
+        );
+        const branchCommits = branchCommitsResult.items;
+        const headIndex = branchCommits.findIndex((commit) => commit.sha === pushEvent.commitSha);
 
-      if (headIndex >= 0) {
-        const rangeSummaries = branchCommits.slice(headIndex);
+        if (headIndex >= 0) {
+          const rangeSummaries = branchCommits.slice(headIndex);
 
-        for (const summary of rangeSummaries) {
-          const commit = await GithubAppService.getCommit(
-            pushEvent.repository.installationId,
-            pushEvent.repository.fullName,
-            summary.sha
-          );
-          const files = commit.files
-            .filter((file) => selectedFilePaths.has(file.filename))
-            .map((file) => ({
-              filePath: file.filename,
-              changeType: file.status,
-              additions: file.additions,
-              deletions: file.deletions,
-            }));
+          for (const summary of rangeSummaries) {
+            const commit = await GithubAppService.getCommit(
+              pushEvent.repository.installationId,
+              pushEvent.repository.fullName,
+              summary.sha
+            );
+            const files = commit.files
+              .filter((file) => selectedFilePaths.has(file.filename))
+              .map((file) => ({
+                filePath: file.filename,
+                changeType: file.status,
+                additions: file.additions,
+                deletions: file.deletions,
+              }));
 
-          if (files.length > 0) {
-            commitFileGroups.push({
-              sha: commit.sha,
-              message: commit.message,
-              authorName: commit.authorName,
-              date: commit.date,
-              files,
-            });
-          }
+            if (files.length > 0) {
+              commitFileGroups.push({
+                sha: commit.sha,
+                message: commit.message,
+                authorName: commit.authorName,
+                date: commit.date,
+                files,
+              });
+            }
 
-          if (commit.parentSha === pushEvent.baseSha) {
-            break;
+            if (commit.parentSha === pushEvent.baseSha) {
+              break;
+            }
           }
         }
+      } catch (groupError) {
+        console.warn(`[PushEvents] Failed to build commit file groups for ${pushEvent.id}:`, groupError);
       }
-    } catch (groupError) {
-      console.warn(`[PushEvents] Failed to build commit file groups for ${pushEvent.id}:`, groupError);
     }
 
     res.json({

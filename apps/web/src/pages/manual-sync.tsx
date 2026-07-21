@@ -5,6 +5,9 @@ import {
   ArrowLeft,
   ArrowRight,
   CheckCircle2,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   FileCode,
   GitCommit,
   GitMerge,
@@ -28,7 +31,9 @@ export function ManualSyncPage() {
   const [commitPage, setCommitPage] = useState(1);
   const [commitSearch, setCommitSearch] = useState("");
   const [filePaths, setFilePaths] = useState<string[]>([]);
-  const commitPageSize = 20;
+  const [commitPageSize, setCommitPageSize] = useState(10);
+  const [isSelectingAll, setIsSelectingAll] = useState(false);
+  const [syncMode, setSyncMode] = useState<"commits" | "branch">("commits");
 
   const { data: repos = [], isLoading: reposLoading } = useQuery({
     queryKey: ["repositories"],
@@ -64,9 +69,59 @@ export function ManualSyncPage() {
   });
   const commits = commitsResult?.items || [];
 
+  const selectedCommits = useMemo(
+    () => commitShas.map((sha) => selectedCommitCache[sha]).filter(Boolean),
+    [commitShas, selectedCommitCache]
+  );
+  const selectedCommitIndexes = commitShas
+    .map((sha) => selectedCommitCache[sha]?.listIndex)
+    .filter((index) => index >= 0);
+  const areSelectedCommitsContiguous =
+    selectedCommitIndexes.length <= 1 ||
+    Math.max(...selectedCommitIndexes) - Math.min(...selectedCommitIndexes) + 1 === selectedCommitIndexes.length;
+
   const { data: commitDetail, isLoading: filesLoading } = useQuery({
     queryKey: ["commit-files", mainRepoId, commitShas],
     queryFn: async () => {
+      if (commitShas.length === 0) return { files: [] };
+      if (commitShas.length === 1) {
+        const detail = await api.getCommitFiles(mainRepoId, commitShas[0]);
+        return { files: detail.files };
+      }
+
+      if (selectedCommits.length === commitShas.length) {
+        const oldestCommit = selectedCommits.reduce((oldest, current) => {
+          return (current.listIndex > oldest.listIndex) ? current : oldest;
+        }, selectedCommits[0]);
+
+        const newestCommit = selectedCommits.reduce((newest, current) => {
+          return (current.listIndex < newest.listIndex) ? current : newest;
+        }, selectedCommits[0]);
+
+        if (oldestCommit && newestCommit) {
+          try {
+            const oldestDetail = await api.getCommitFiles(mainRepoId, oldestCommit.sha);
+            const parentSha = oldestDetail.parentSha;
+            if (parentSha) {
+              const compare = await api.compareRepoCommits(mainRepoId, parentSha, newestCommit.sha);
+              return { files: compare.files };
+            } else {
+              const compare = await api.compareRepoCommits(mainRepoId, oldestCommit.sha, newestCommit.sha);
+              const filesByPath = new Map<string, any>();
+              for (const file of oldestDetail.files) {
+                filesByPath.set(file.filename, file);
+              }
+              for (const file of compare.files) {
+                filesByPath.set(file.filename, file);
+              }
+              return { files: Array.from(filesByPath.values()).sort((a, b) => a.filename.localeCompare(b.filename)) };
+            }
+          } catch (err) {
+            console.warn("Optimized compare failed, falling back to batch loading files", err);
+          }
+        }
+      }
+
       const details = await Promise.all(commitShas.map((sha) => api.getCommitFiles(mainRepoId, sha)));
       const filesByPath = new Map<string, {
         filename: string;
@@ -91,27 +146,33 @@ export function ManualSyncPage() {
 
       return { files: Array.from(filesByPath.values()).sort((a, b) => a.filename.localeCompare(b.filename)) };
     },
-    enabled: step >= 3 && !!mainRepoId && commitShas.length > 0,
+    enabled: step >= 3 && !!mainRepoId && commitShas.length > 0 && selectedCommits.length > 0,
   });
 
-  const selectedCommits = useMemo(
-    () => commitShas.map((sha) => selectedCommitCache[sha]).filter(Boolean),
-    [commitShas, selectedCommitCache]
-  );
-  const selectedCommitIndexes = commitShas
-    .map((sha) => selectedCommitCache[sha]?.listIndex)
-    .filter((index) => index >= 0);
-  const areSelectedCommitsContiguous =
-    selectedCommitIndexes.length <= 1 ||
-    Math.max(...selectedCommitIndexes) - Math.min(...selectedCommitIndexes) + 1 === selectedCommitIndexes.length;
+  const defaultBranch = selectedMainRepo?.branch || "";
+
+  const { data: branchCompareResult, isLoading: branchCompareLoading } = useQuery({
+    queryKey: ["branch-compare", mainRepoId, defaultBranch, mainBranch],
+    queryFn: () => api.compareRepoCommits(mainRepoId, defaultBranch, mainBranch),
+    enabled:
+      step >= 2 &&
+      syncMode === "branch" &&
+      !!mainRepoId &&
+      !!defaultBranch &&
+      !!mainBranch &&
+      mainBranch !== defaultBranch,
+  });
 
   const manualSyncMutation = useMutation({
     mutationFn: () =>
       api.createManualSync({
         mainRepoId,
         targetRepoIds,
-        commitShas,
-        filePaths,
+        commitShas: syncMode === "commits" ? commitShas : undefined,
+        filePaths: syncMode === "branch" ? ["*"] : filePaths,
+        syncMode,
+        baseBranch: syncMode === "branch" ? defaultBranch : undefined,
+        compareBranch: syncMode === "branch" ? mainBranch : undefined,
       }),
     onSuccess: (data) => {
       toast.success("Review page prepared. Dry-run check is running.");
@@ -128,12 +189,25 @@ export function ManualSyncPage() {
   });
 
   const canContinueFromRepos = !!mainRepoId && !!mainBranch && targetRepoIds.length > 0;
-  const canContinueFromCommit = commitShas.length > 0 && areSelectedCommitsContiguous;
+  const canContinueFromCommit =
+    syncMode === "branch"
+      ? !!mainBranch
+      : commitShas.length > 0 && areSelectedCommitsContiguous;
+
   const canProceedToReview = filePaths.length > 0 && !manualSyncMutation.isPending;
   const childRepoIds = childRepos.map((repo) => repo.id);
   const areAllChildReposSelected =
     childRepoIds.length > 0 && childRepoIds.every((repoId) => targetRepoIds.includes(repoId));
-  const changedFiles = commitDetail?.files || [];
+
+  const changedFiles = useMemo(() => {
+    if (syncMode === "branch") {
+      return branchCompareResult?.files || [];
+    }
+    return commitDetail?.files || [];
+  }, [syncMode, branchCompareResult, commitDetail]);
+
+  const isFilesLoading = filesLoading || (syncMode === "branch" && branchCompareLoading);
+
   const areAllFilesSelected =
     changedFiles.length > 0 && changedFiles.every((file) => filePaths.includes(file.filename));
 
@@ -177,6 +251,91 @@ export function ManualSyncPage() {
       };
     });
     setFilePaths([]);
+  };
+
+  const isAllOnPageSelected =
+    commits.length > 0 && commits.every((commit) => commitShas.includes(commit.sha));
+
+  const toggleSelectAllOnPage = () => {
+    if (isAllOnPageSelected) {
+      const pageShas = commits.map((c) => c.sha);
+      setCommitShas((current) => current.filter((sha) => !pageShas.includes(sha)));
+      setSelectedCommitCache((current) => {
+        const next = { ...current };
+        for (const sha of pageShas) {
+          delete next[sha];
+        }
+        return next;
+      });
+    } else {
+      const shasToAdd: string[] = [];
+      const cacheUpdates: Record<string, any> = {};
+
+      commits.forEach((commit, visibleIndex) => {
+        const listIndex = (commitPage - 1) * commitPageSize + visibleIndex;
+        if (!commitShas.includes(commit.sha)) {
+          shasToAdd.push(commit.sha);
+        }
+        cacheUpdates[commit.sha] = {
+          ...commit,
+          listIndex,
+        };
+      });
+
+      setCommitShas((current) => [...current, ...shasToAdd]);
+      setSelectedCommitCache((current) => ({
+        ...current,
+        ...cacheUpdates,
+      }));
+    }
+    setFilePaths([]);
+  };
+
+  const isAllCommitsSelected =
+    commitsResult?.total && commitsResult.total > 0 ? commitShas.length >= commitsResult.total : false;
+
+  const toggleSelectAllCommits = async () => {
+    if (isAllCommitsSelected) {
+      resetCommitSelection();
+      return;
+    }
+
+    try {
+      setIsSelectingAll(true);
+      const allCommits: any[] = [];
+      let currentPage = 1;
+      let hasNext = true;
+
+      while (hasNext && currentPage <= 10) {
+        const result = await api.getRepoCommits(mainRepoId, mainBranch, {
+          page: currentPage,
+          pageSize: 100,
+          search: commitSearch.trim() || undefined,
+        });
+
+        allCommits.push(...(result.items || []));
+        hasNext = result.hasNextPage && allCommits.length < (result.total || 0);
+        currentPage += 1;
+      }
+
+      const shas = allCommits.map((c) => c.sha);
+      const cache: Record<string, any> = {};
+      allCommits.forEach((commit, idx) => {
+        cache[commit.sha] = {
+          ...commit,
+          listIndex: idx,
+        };
+      });
+
+      setCommitShas(shas);
+      setSelectedCommitCache(cache);
+      setFilePaths([]);
+    } catch (err) {
+      console.error("Failed to select all commits", err);
+      toast.error("Failed to select all commits");
+    } finally {
+      setIsSelectingAll(false);
+    }
   };
 
   const toggleFile = (filePath: string) => {
@@ -300,11 +459,10 @@ export function ManualSyncPage() {
                   childRepos.map((repo) => (
                     <label
                       key={repo.id}
-                      className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
-                        targetRepoIds.includes(repo.id)
-                          ? "bg-success/10 border-success/30 text-text-primary"
-                          : "bg-card border-border hover:bg-card-hover text-text-secondary"
-                      }`}
+                      className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${targetRepoIds.includes(repo.id)
+                        ? "bg-success/10 border-success/30 text-text-primary"
+                        : "bg-card border-border hover:bg-card-hover text-text-secondary"
+                        }`}
                     >
                       <input
                         type="checkbox"
@@ -351,91 +509,247 @@ export function ManualSyncPage() {
             </Button>
           </div>
 
-          <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
-            <div className="relative w-full md:max-w-md">
-              <Search className="w-4 h-4 text-text-muted absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
-              <input
-                value={commitSearch}
-                onChange={(e) => {
-                  setCommitSearch(e.target.value);
-                  setCommitPage(1);
+          <div className="flex border-b border-border pb-3">
+            <div className="flex gap-2 bg-page p-1 rounded-lg border border-border">
+              <button
+                type="button"
+                onClick={() => {
+                  setSyncMode("commits");
+                  resetCommitSelection();
                 }}
-                placeholder="Search current commit page by message, author, or SHA"
-                className="w-full h-10 rounded-lg bg-page border border-border hover:border-border-light focus:border-accent pl-9 pr-3 text-sm text-text-primary placeholder:text-text-muted focus:outline-none transition-colors"
-              />
-            </div>
-            <div className="flex items-center gap-2 text-3xs text-text-muted">
-              {commitsFetching && !commitsLoading && <Loader2 className="w-3.5 h-3.5 animate-spin text-accent" />}
-              <span>Page {commitsResult?.page || commitPage}</span>
-              <Button
-                type="button"
-                variant="secondary"
-                onClick={() => setCommitPage((page) => Math.max(1, page - 1))}
-                disabled={!commitsResult?.hasPreviousPage || commitsFetching}
-                className="h-8 text-3xs px-2.5"
+                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-all ${
+                  syncMode === "commits"
+                    ? "bg-card text-text-primary shadow-sm border border-border"
+                    : "text-text-secondary hover:text-text-primary"
+                }`}
               >
-                Previous
-              </Button>
-              <Button
+                Select Commits
+              </button>
+              <button
                 type="button"
-                variant="secondary"
-                onClick={() => setCommitPage((page) => page + 1)}
-                disabled={!commitsResult?.hasNextPage || commitsFetching}
-                className="h-8 text-3xs px-2.5"
+                onClick={() => {
+                  setSyncMode("branch");
+                  resetCommitSelection();
+                }}
+                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-all ${
+                  syncMode === "branch"
+                    ? "bg-card text-text-primary shadow-sm border border-border"
+                    : "text-text-secondary hover:text-text-primary"
+                }`}
               >
-                Next
-              </Button>
+                Sync Entire Branch
+              </button>
             </div>
           </div>
 
-          {commitsLoading ? (
-            <LoadingText text="Loading commits from GitHub..." />
-          ) : commits.length === 0 ? (
-            <div className="bg-page/50 border border-dashed border-border rounded-lg p-8 text-center text-xs text-text-muted">
-              No commits found on this page. Try another page or clear the search.
-            </div>
-          ) : (
-            <div className="space-y-2 max-h-[520px] overflow-y-auto">
-              {commits.map((commit, index) => (
-                <label
-                  key={commit.sha}
-                  className={`w-full p-4 rounded-lg border text-left transition-colors cursor-pointer flex items-start gap-3 ${
-                    commitShas.includes(commit.sha)
-                      ? "border-accent bg-accent/10"
-                      : "border-border bg-page/50 hover:bg-card-hover"
-                  }`}
-                >
+          {syncMode === "commits" ? (
+            <>
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+                <div className="relative w-full md:max-w-md">
+                  <Search className="w-4 h-4 text-text-muted absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
                   <input
-                    type="checkbox"
-                    checked={commitShas.includes(commit.sha)}
-                    onChange={() => toggleCommit(commit, index)}
-                    className="w-4 h-4 rounded border-border text-accent focus:ring-accent bg-page cursor-pointer mt-0.5"
+                    value={commitSearch}
+                    onChange={(e) => {
+                      setCommitSearch(e.target.value);
+                      setCommitPage(1);
+                    }}
+                    placeholder="Search current commit page by message, author, or SHA"
+                    className="w-full h-10 rounded-lg bg-page border border-border hover:border-border-light focus:border-accent pl-9 pr-3 text-sm text-text-primary placeholder:text-text-muted focus:outline-none transition-colors"
                   />
-                  <div className="min-w-0 flex-1">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="font-mono text-3xs px-2 py-0.5 rounded bg-card border border-border text-text-secondary">
-                        {commit.sha.substring(0, 7)}
-                      </span>
-                      <span className="text-xs font-semibold text-text-primary line-clamp-1">
-                        {commit.message.split("\n")[0]}
-                      </span>
+                </div>
+                <div className="flex items-center gap-3">
+                  {commitShas.length > 0 && (
+                    <span className="text-xs text-text-secondary font-medium mr-1 bg-accent/10 text-accent px-2.5 py-1 rounded-md border border-accent/20">
+                      {commitShas.length} selected
+                    </span>
+                  )}
+                  {commits.length > 0 && (
+                    <>
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        onClick={toggleSelectAllCommits}
+                        disabled={isSelectingAll}
+                        className="h-10 text-xs px-4 flex items-center gap-1.5"
+                      >
+                        {isSelectingAll && <Loader2 className="w-3.5 h-3.5 animate-spin text-accent" />}
+                        {isAllCommitsSelected ? "Deselect all" : "Select all"}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        onClick={toggleSelectAllOnPage}
+                        className="h-10 text-xs px-4"
+                      >
+                        {isAllOnPageSelected ? "Deselect page" : "Select page"}
+                      </Button>
+                    </>
+                  )}
+                  {commitsFetching && !commitsLoading && (
+                    <div className="flex items-center gap-1.5 text-xs text-text-muted">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-accent" />
+                      <span>Updating...</span>
                     </div>
-                    <p className="text-3xs text-text-muted mt-1">
-                      {commit.authorName} - {new Date(commit.date).toLocaleString()}
-                    </p>
+                  )}
+                </div>
+              </div>
+
+              {commitsLoading ? (
+                <LoadingText text="Loading commits from GitHub..." />
+              ) : commits.length === 0 ? (
+                <div className="bg-page/50 border border-dashed border-border rounded-lg p-8 text-center text-xs text-text-muted">
+                  No commits found on this page. Try another page or clear the search.
+                </div>
+              ) : (
+                <div className="space-y-2 max-h-[520px] overflow-y-auto">
+                  {commits.map((commit, index) => (
+                    <label
+                      key={commit.sha}
+                      className={`w-full p-4 rounded-lg border text-left transition-colors cursor-pointer flex items-start gap-3 ${commitShas.includes(commit.sha)
+                        ? "border-accent bg-accent/10"
+                        : "border-border bg-page/50 hover:bg-card-hover"
+                        }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={commitShas.includes(commit.sha)}
+                        onChange={() => toggleCommit(commit, index)}
+                        className="w-4 h-4 rounded border-border text-accent focus:ring-accent bg-page cursor-pointer mt-0.5"
+                      />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-mono text-3xs px-2 py-0.5 rounded bg-card border border-border text-text-secondary">
+                            {commit.sha.substring(0, 7)}
+                          </span>
+                          <span className="text-xs font-semibold text-text-primary line-clamp-1">
+                            {commit.message.split("\n")[0]}
+                          </span>
+                        </div>
+                        <p className="text-3xs text-text-muted mt-1">
+                          {commit.authorName} - {new Date(commit.date).toLocaleString()}
+                        </p>
+                      </div>
+                    </label>
+                  ))}
+                </div>
+              )}
+
+              {!commitsLoading && commits.length > 0 && (
+                <div className="flex flex-col sm:flex-row items-center justify-between gap-4 border-t border-border pt-4 mt-2">
+                  <div className="text-xs text-text-secondary">
+                    Showing {Math.min((commitPage - 1) * commitPageSize + 1, commitsResult?.total || 0)} to{" "}
+                    {Math.min(commitPage * commitPageSize, commitsResult?.total || 0)} of {commitsResult?.total || 0} results
                   </div>
-                </label>
-              ))}
+
+                  <div className="flex flex-wrap items-center gap-4">
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-text-secondary">Per page</span>
+                      <div className="relative">
+                        <select
+                          value={commitPageSize}
+                          onChange={(e) => {
+                            setCommitPageSize(Number(e.target.value));
+                            setCommitPage(1);
+                          }}
+                          className="h-8 rounded-lg bg-page border border-border hover:border-border-light focus:border-accent pl-2.5 pr-8 text-xs text-text-primary focus:outline-none transition-colors appearance-none cursor-pointer font-medium"
+                        >
+                          <option value={10}>10</option>
+                          <option value={20}>20</option>
+                          <option value={50}>50</option>
+                        </select>
+                        <ChevronDown className="w-3.5 h-3.5 text-text-muted absolute right-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                      </div>
+                    </div>
+
+                    {(commitsResult?.totalPages || 1) > 1 && (
+                      <div className="border border-border rounded-lg flex items-center divide-x divide-border bg-page overflow-hidden">
+                        <button
+                          type="button"
+                          onClick={() => setCommitPage((p) => Math.max(1, p - 1))}
+                          disabled={commitPage === 1 || commitsFetching}
+                          className="w-8 h-8 flex items-center justify-center text-xs font-semibold text-text-secondary hover:bg-card-hover transition-colors disabled:opacity-50"
+                        >
+                          <ChevronLeft className="w-3.5 h-3.5" />
+                        </button>
+
+                        {getPaginationRange(commitPage, commitsResult?.totalPages || 1).map((p, idx) => {
+                          if (p === "...") {
+                            return (
+                              <span
+                                key={`dots-${idx}`}
+                                className="w-8 h-8 flex items-center justify-center text-xs font-semibold text-text-muted bg-page select-none"
+                              >
+                                ...
+                              </span>
+                            );
+                          }
+
+                          const pageNum = p as number;
+                          const isActive = pageNum === commitPage;
+
+                          return (
+                            <button
+                              key={`page-${pageNum}`}
+                              type="button"
+                              onClick={() => setCommitPage(pageNum)}
+                              disabled={commitsFetching}
+                              className={`w-8 h-8 flex items-center justify-center text-xs font-semibold transition-colors ${isActive
+                                ? "text-accent bg-accent/10 font-bold"
+                                : "text-text-secondary hover:bg-card-hover bg-page"
+                                }`}
+                            >
+                              {pageNum}
+                            </button>
+                          );
+                        })}
+
+                        <button
+                          type="button"
+                          onClick={() => setCommitPage((p) => Math.min(commitsResult?.totalPages || 1, p + 1))}
+                          disabled={commitPage === (commitsResult?.totalPages || 1) || commitsFetching}
+                          className="w-8 h-8 flex items-center justify-center text-xs font-semibold text-text-secondary hover:bg-card-hover transition-colors disabled:opacity-50"
+                        >
+                          <ChevronRight className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="space-y-4">
+              <div className="bg-accent/5 border border-accent/20 rounded-lg p-4 text-xs text-text-secondary flex justify-between items-center">
+                <span>
+                  Syncing entire branch <span className="font-semibold text-text-primary">"{mainBranch}"</span> directly to target repositories.
+                </span>
+                <span className="text-3xs font-mono text-text-muted">
+                  Branch: {mainBranch}
+                </span>
+              </div>
+              <div className="bg-page/50 border border-dashed border-border rounded-lg p-8 text-center text-xs text-text-muted">
+                No commit-level selection is required for entire branch sync. 
+                <br />
+                All changes on the branch <span className="font-semibold text-text-primary">"{mainBranch}"</span> will be merged directly into the selected child repositories.
+              </div>
             </div>
           )}
 
-          <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border pt-4">
             <p className="text-xs text-text-secondary">
-              {commitShas.length} commit{commitShas.length === 1 ? "" : "s"} selected.
-              {!areSelectedCommitsContiguous && " Select every commit between the oldest and newest selected commit."}
+              {syncMode === "branch" ? (
+                <span className="text-success font-medium">
+                  The entire branch "{mainBranch}" will be merged directly.
+                </span>
+              ) : (
+                <>
+                  {commitShas.length} commit{commitShas.length === 1 ? "" : "s"} selected.
+                  {!areSelectedCommitsContiguous && " Select every commit between the oldest and newest selected commit."}
+                </>
+              )}
             </p>
             <div className="flex items-center gap-2">
-              {commitShas.length > 0 && (
+              {syncMode === "commits" && commitShas.length > 0 && (
                 <Button
                   type="button"
                   variant="secondary"
@@ -446,12 +760,31 @@ export function ManualSyncPage() {
                 </Button>
               )}
               <Button
-                disabled={!canContinueFromCommit}
-                onClick={() => setStep(3)}
+                disabled={syncMode === "branch" ? !mainBranch || manualSyncMutation.isPending : !canContinueFromCommit}
+                onClick={() => {
+                  if (syncMode === "branch") {
+                    manualSyncMutation.mutate();
+                  } else {
+                    setStep(3);
+                  }
+                }}
                 className="text-xs flex items-center gap-1.5"
               >
-                Continue to Files
-                <ArrowRight className="w-3.5 h-3.5" />
+                {syncMode === "branch" ? (
+                  <>
+                    Proceed to Review
+                    {manualSyncMutation.isPending ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <ArrowRight className="w-3.5 h-3.5" />
+                    )}
+                  </>
+                ) : (
+                  <>
+                    Continue to Files
+                    <ArrowRight className="w-3.5 h-3.5" />
+                  </>
+                )}
               </Button>
             </div>
           </div>
@@ -466,10 +799,16 @@ export function ManualSyncPage() {
                 <FileCode className="w-4 h-4 text-accent" />
                 Select Files
               </h2>
-              {selectedCommits.length > 0 && (
+              {syncMode === "branch" ? (
                 <p className="text-3xs text-text-muted mt-1">
-                  {selectedCommits.length} commit{selectedCommits.length === 1 ? "" : "s"} selected
+                  Syncing entire branch {mainBranch} (compared to {defaultBranch})
                 </p>
+              ) : (
+                selectedCommits.length > 0 && (
+                  <p className="text-3xs text-text-muted mt-1">
+                    {selectedCommits.length} commit{selectedCommits.length === 1 ? "" : "s"} selected
+                  </p>
+                )
               )}
             </div>
             <div className="flex items-center gap-2">
@@ -490,22 +829,23 @@ export function ManualSyncPage() {
             </div>
           </div>
 
-          {filesLoading ? (
+          {isFilesLoading ? (
             <LoadingText text="Loading changed files..." />
           ) : changedFiles.length === 0 ? (
             <div className="bg-page/50 border border-dashed border-border rounded-lg p-8 text-center text-xs text-text-muted">
-              No changed files were returned for the selected commit range.
+              {syncMode === "branch"
+                ? "No changed files were found between the selected branches."
+                : "No changed files were returned for the selected commit range."}
             </div>
           ) : (
             <div className="space-y-2 max-h-[520px] overflow-y-auto">
               {changedFiles.map((file) => (
                 <label
                   key={file.filename}
-                  className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
-                    filePaths.includes(file.filename)
-                      ? "bg-accent/10 border-accent/30 text-text-primary"
-                      : "bg-page/50 border-border hover:bg-card-hover text-text-secondary"
-                  }`}
+                  className={`flex items-center gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${filePaths.includes(file.filename)
+                    ? "bg-accent/10 border-accent/30 text-text-primary"
+                    : "bg-page/50 border-border hover:bg-card-hover text-text-secondary"
+                    }`}
                 >
                   <input
                     type="checkbox"
@@ -558,4 +898,47 @@ function LoadingText({ text }: { text: string }) {
       {text}
     </div>
   );
+}
+
+function getPaginationRange(current: number, total: number) {
+  const pages: (number | string)[] = [];
+
+  if (total <= 7) {
+    for (let i = 1; i <= total; i++) {
+      pages.push(i);
+    }
+    return pages;
+  }
+
+  let start = Math.max(3, current - 1);
+  let end = Math.min(total - 2, current + 1);
+
+  if (current <= 3) {
+    start = 3;
+    end = 4;
+  }
+  if (current >= total - 2) {
+    start = total - 3;
+    end = total - 2;
+  }
+
+  pages.push(1);
+  pages.push(2);
+
+  if (start > 3) {
+    pages.push("...");
+  }
+
+  for (let i = start; i <= end; i++) {
+    pages.push(i);
+  }
+
+  if (end < total - 2) {
+    pages.push("...");
+  }
+
+  pages.push(total - 1);
+  pages.push(total);
+
+  return pages;
 }

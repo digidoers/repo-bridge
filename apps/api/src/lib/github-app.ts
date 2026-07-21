@@ -70,6 +70,23 @@ export class GithubAppService {
       key = key.replace(/\\n/g, "\n");
     }
 
+    // If the key has no internal newlines but contains header/footer, it's a flattened PEM.
+    // Format it properly to be a valid PEM key.
+    if (key.includes("-----BEGIN") && !key.includes("\n")) {
+      const match = key.match(/(-----BEGIN[^-]+-----)(.*)(-----END[^-]+-----)/);
+      if (match) {
+        const header = match[1];
+        const body = match[2].replace(/\s+/g, "");
+        const footer = match[3];
+        
+        const lines = [];
+        for (let i = 0; i < body.length; i += 64) {
+          lines.push(body.slice(i, i + 64));
+        }
+        key = `${header}\n${lines.join("\n")}\n${footer}\n`;
+      }
+    }
+
     return jwt.sign(payload, key, { algorithm: "RS256" });
   }
 
@@ -350,6 +367,15 @@ export class GithubAppService {
     base: string,
     head: string
   ): Promise<{
+    baseSha: string;
+    headSha: string;
+    commits: Array<{
+      sha: string;
+      message: string;
+      authorName: string;
+      authorEmail: string;
+      date: string;
+    }>;
     files: Array<{
       filename: string;
       status: string;
@@ -380,6 +406,19 @@ export class GithubAppService {
     }
 
     const compareData = (await compareRes.json()) as {
+      base_commit?: { sha: string };
+      merge_base_commit?: { sha: string };
+      commits?: Array<{
+        sha: string;
+        commit: {
+          message: string;
+          author?: {
+            name?: string;
+            email?: string;
+            date?: string;
+          };
+        };
+      }>;
       files?: Array<{
         filename: string;
         status: string;
@@ -389,7 +428,21 @@ export class GithubAppService {
       }>;
     };
 
+    const commits = (compareData.commits || []).map((c) => ({
+      sha: c.sha,
+      message: c.commit.message,
+      authorName: c.commit.author?.name || "Unknown",
+      authorEmail: c.commit.author?.email || "",
+      date: c.commit.author?.date || new Date().toISOString(),
+    }));
+
+    const baseSha = compareData.merge_base_commit?.sha || compareData.base_commit?.sha || base;
+    const headSha = commits.length > 0 ? commits[commits.length - 1].sha : head;
+
     return {
+      baseSha,
+      headSha,
+      commits,
       files: compareData.files || [],
     };
   }
@@ -441,9 +494,9 @@ export class GithubAppService {
     fullName: string,
     branch: string,
     options: { page?: number; pageSize?: number; search?: string } = {}
-  ): Promise<{ items: GithubCommitSummary[]; page: number; pageSize: number; hasNextPage: boolean; hasPreviousPage: boolean }> {
+  ): Promise<{ items: GithubCommitSummary[]; page: number; pageSize: number; hasNextPage: boolean; hasPreviousPage: boolean; total: number; totalPages: number }> {
     const page = Math.max(1, options.page || 1);
-    const pageSize = Math.min(50, Math.max(10, options.pageSize || 20));
+    const pageSize = Math.min(100, Math.max(10, options.pageSize || 20));
     const token = await this.getInstallationToken(installationId);
     const res = await fetch(
       `https://api.github.com/repos/${fullName}/commits?sha=${encodeURIComponent(branch)}&per_page=${pageSize}&page=${page}`,
@@ -489,12 +542,33 @@ export class GithubAppService {
       );
     });
 
+    const linkHeader = res.headers.get("Link");
+    let totalPages = page;
+    if (linkHeader) {
+      const match = linkHeader.match(/<[^>]*[?&]page=(\d+)[^>]*>;\s*rel="last"/);
+      if (match) {
+        totalPages = parseInt(match[1], 10);
+      } else {
+        const nextMatch = linkHeader.match(/<[^>]*[?&]page=(\d+)[^>]*>;\s*rel="next"/);
+        if (nextMatch) {
+          totalPages = Math.max(totalPages, parseInt(nextMatch[1], 10));
+        }
+      }
+    }
+
+    let total = totalPages * pageSize;
+    if (page === totalPages) {
+      total = (totalPages - 1) * pageSize + data.length;
+    }
+
     return {
       items: commits,
       page,
       pageSize,
       hasNextPage: data.length === pageSize,
       hasPreviousPage: page > 1,
+      total,
+      totalPages,
     };
   }
 

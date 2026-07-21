@@ -130,12 +130,99 @@ class SyncQueue {
       // 4. Add upstream remote and fetch commits
       const mainUrl = `https://x-access-token:${mainToken}@github.com/${mainRepo.fullName}.git`;
       runGit(["remote", "add", "upstream", mainUrl], targetDir);
-      runGit(["fetch", "upstream", job.pushEvent.baseSha, job.pushEvent.commitSha], targetDir, { stdio: "ignore" });
+      
+      const fetchArgs = ["fetch", "upstream"];
+      if (job.pushEvent.baseSha !== "HEAD") {
+        fetchArgs.push(job.pushEvent.baseSha);
+      }
+      fetchArgs.push(job.pushEvent.commitSha);
+      runGit(fetchArgs, targetDir, { stdio: "ignore" });
 
-      // 5. Build patch file for selected files only
+      // 5. Build patch file for selected files (dynamically computed if baseSha is HEAD)
+      let selectedPaths: string[] = [];
+      if (job.pushEvent.baseSha === "HEAD") {
+        const diffFilesStr = runGit(["diff", "--name-only", "HEAD", job.pushEvent.commitSha], targetDir);
+        selectedPaths = diffFilesStr.split("\n").map(f => f.trim()).filter(Boolean);
+
+        // Delete the placeholder '*' file record from SyncJobFile
+        await prisma.syncJobFile.deleteMany({
+          where: { syncJobId: job.id }
+        });
+
+        // Create the actual file records for this sync job
+        if (selectedPaths.length > 0) {
+          await prisma.syncJobFile.createMany({
+            data: selectedPaths.map(filePath => ({
+              syncJobId: job.id,
+              filePath,
+              mergeResult: "PENDING" as const,
+            }))
+          });
+        }
+
+        // Populate or update the PushFile records for this pushEvent
+        for (const filePath of selectedPaths) {
+          try {
+            const filePatch = runGit(["diff", "--binary", "HEAD", job.pushEvent.commitSha, "--", filePath], targetDir);
+            let additions = 0;
+            let deletions = 0;
+            const lines = filePatch.split("\n");
+            for (const line of lines) {
+              if (line.startsWith("+") && !line.startsWith("+++")) additions++;
+              if (line.startsWith("-") && !line.startsWith("---")) deletions++;
+            }
+
+            const existingPushFile = await prisma.pushFile.findFirst({
+              where: {
+                pushEventId: job.pushEventId,
+                filePath
+              }
+            });
+
+            if (existingPushFile) {
+              await prisma.pushFile.update({
+                where: { id: existingPushFile.id },
+                data: {
+                  patch: filePatch,
+                  additions,
+                  deletions,
+                }
+              });
+            } else {
+              await prisma.pushFile.create({
+                data: {
+                  pushEventId: job.pushEventId,
+                  filePath,
+                  changeType: "modified",
+                  patch: filePatch,
+                  additions,
+                  deletions,
+                }
+              });
+            }
+          } catch (diffErr) {
+            console.error(`Failed to get diff for file ${filePath}:`, diffErr);
+          }
+        }
+
+        // Remove the placeholder '*' from PushFile if it exists
+        await prisma.pushFile.deleteMany({
+          where: {
+            pushEventId: job.pushEventId,
+            filePath: "*"
+          }
+        });
+
+        // Reload files for this job
+        job.files = await prisma.syncJobFile.findMany({
+          where: { syncJobId: job.id }
+        });
+      } else {
+        selectedPaths = job.files.map((f: any) => f.filePath);
+      }
+
       const patchFile = path.join(tempDir, "selected.patch");
-      const selectedPaths = job.files.map((f: any) => f.filePath);
-      const selectedPatch = runGit(["diff", job.pushEvent.baseSha, job.pushEvent.commitSha, "--", ...selectedPaths], targetDir);
+      const selectedPatch = runGit(["diff", "--binary", job.pushEvent.baseSha, job.pushEvent.commitSha, "--", ...selectedPaths], targetDir);
       fs.writeFileSync(patchFile, selectedPatch);
 
       // 6. Checkout temporary branch for checking
@@ -538,12 +625,18 @@ class SyncQueue {
       // 4. Add upstream remote and fetch commits
       const mainUrl = `https://x-access-token:${mainToken}@github.com/${mainRepo.fullName}.git`;
       runGit(["remote", "add", "upstream", mainUrl], targetDir);
-      runGit(["fetch", "upstream", job.pushEvent.baseSha, job.pushEvent.commitSha], targetDir, { stdio: "ignore" });
+      
+      const fetchArgs = ["fetch", "upstream"];
+      if (job.pushEvent.baseSha !== "HEAD") {
+        fetchArgs.push(job.pushEvent.baseSha);
+      }
+      fetchArgs.push(job.pushEvent.commitSha);
+      runGit(fetchArgs, targetDir, { stdio: "ignore" });
 
       // 5. Build patch file for selected files only
       const patchFile = path.join(tempDir, "selected.patch");
       const selectedPaths = job.files.map((f: any) => f.filePath);
-      const selectedPatch = runGit(["diff", job.pushEvent.baseSha, job.pushEvent.commitSha, "--", ...selectedPaths], targetDir);
+      const selectedPatch = runGit(["diff", "--binary", job.pushEvent.baseSha, job.pushEvent.commitSha, "--", ...selectedPaths], targetDir);
       fs.writeFileSync(patchFile, selectedPatch);
 
       if (selectedPatch.trim().length === 0) {
@@ -574,6 +667,13 @@ class SyncQueue {
       const shortSha = job.pushEvent.commitSha.substring(0, 7);
       const branchName = sanitizeBranchPart(`sync/main-${shortSha}-${jobId.substring(0, 8)}`);
       runGit(["checkout", "-b", branchName], targetDir);
+
+      // Save branchName in DB immediately so that subsequent commit/push/PR errors
+      // are correctly recognized as apply stage failures in the UI.
+      await prisma.syncJob.update({
+        where: { id: jobId },
+        data: { branchName },
+      });
 
       // 7. Apply patch. If the user saved conflict resolutions, those files
       // override the patch result before we stage and commit.
@@ -641,7 +741,23 @@ class SyncQueue {
       runGit(["-c", "user.name=Sync Bot", "-c", "user.email=sync-bot@yourcompany.com", "commit", "-m", commitMsg], targetDir);
 
       // 9. Push branch
-      runGit(["push", "origin", branchName], targetDir, { stdio: "ignore" });
+      try {
+        runGit(["push", "origin", branchName], targetDir, { stdio: "pipe" });
+      } catch (pushErr: any) {
+        let errMsg = pushErr.stderr?.toString() || pushErr.message || "Unknown push error";
+        if (targetToken) errMsg = errMsg.replaceAll(targetToken, "***");
+        if (mainToken) errMsg = errMsg.replaceAll(mainToken, "***");
+
+        if (
+          errMsg.includes("refusing to allow a GitHub App to create or update workflow") &&
+          errMsg.includes("workflows")
+        ) {
+          throw new Error(
+            `Git push rejected: The sync modified a GitHub Actions workflow file, but your GitHub App installation is missing the 'Workflows' read/write permission. Please grant the 'Workflows' permission to your GitHub App in its developer settings on GitHub, or exclude workflow files from this sync.\n\nDetails: ${errMsg.trim()}`
+          );
+        }
+        throw new Error(`Git push failed: ${errMsg.trim()}`);
+      }
 
       // 10. Open Pull Request via GitHub REST API
       const fileListMarkdown = job.files.map((f: any) => `- \`${f.filePath}\``).join("\n");

@@ -1,6 +1,7 @@
 import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
+import fs from "fs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.resolve(__dirname, "../../../.env") });
@@ -38,6 +39,27 @@ function optionalEnv(key: string, fallback: string): string {
   return process.env[key] || fallback;
 }
 
+let cachedEnv: Record<string, string> = {};
+let lastEnvMtime = 0;
+
+function getLiveEnv(key: string, fallback: string): string {
+  try {
+    const envPath = path.resolve(__dirname, "../../../.env");
+    if (fs.existsSync(envPath)) {
+      const stat = fs.statSync(envPath);
+      if (stat.mtimeMs !== lastEnvMtime) {
+        const content = fs.readFileSync(envPath, "utf-8");
+        cachedEnv = dotenv.parse(content);
+        lastEnvMtime = stat.mtimeMs;
+      }
+      return cachedEnv[key] || fallback;
+    }
+  } catch (err) {
+    console.error(`Error reading live env key ${key}:`, err);
+  }
+  return process.env[key] || fallback;
+}
+
 export const config: Config = {
   port: parseInt(optionalEnv("API_PORT", "3001"), 10),
   nodeEnv: optionalEnv("NODE_ENV", "development"),
@@ -57,7 +79,10 @@ export const config: Config = {
     privateKey: optionalEnv("GITHUB_APP_PRIVATE_KEY", ""),
     webhookSecret: optionalEnv("GITHUB_WEBHOOK_SECRET", ""),
   },
-  webUrl: optionalEnv("WEB_URL", "http://localhost:5173"),
+  get webUrl(): string {
+    return getLiveEnv("WEB_URL", "http://localhost:5173");
+  },
   apiUrl: optionalEnv("API_URL", "http://localhost:3001"),
   encryptionKey: optionalEnv("ENCRYPTION_KEY", "change-me-32-byte-hex-key-here!!"),
 };
+

@@ -224,13 +224,17 @@ export function PushEventDetailPage() {
     incomingLabel: string;
   } | null>(null);
 
+  // Filters & performance paging states for Dry-Run results
+  const [syncFileFilter, setSyncFileFilter] = useState<"ALL" | "CONFLICT" | "MERGED" | "CLEAN">("ALL");
+  const [showAllFilesMap, setShowAllFilesMap] = useState<Record<string, boolean>>({});
+
   // Sync targeting states
   const [selectedRepoIds, setSelectedRepoIds] = useState<string[]>([]);
   // Map of repoId -> filePaths[]
   const [fileSelection, setFileSelection] = useState<Record<string, string[]>>({});
 
   // Query: Fetch Push Event detail
-  const { data: event, isLoading, error } = useQuery({
+  const { data: event, isLoading, error, refetch: refetchPushEvent } = useQuery({
     queryKey: ["push-event", id],
     queryFn: () => api.getPushEvent(id as string),
     enabled: !!id,
@@ -263,12 +267,13 @@ export function PushEventDetailPage() {
     if (isAnyJobRunning) {
       intervalId = setInterval(() => {
         refetchSyncJobs();
+        refetchPushEvent();
       }, 2000);
     }
     return () => {
       if (intervalId) clearInterval(intervalId);
     };
-  }, [isAnyJobRunning, refetchSyncJobs]);
+  }, [isAnyJobRunning, refetchSyncJobs, refetchPushEvent]);
 
   // Mutation: Triage Push Event (Mark as TRIAGED)
   const triageMutation = useMutation({
@@ -314,7 +319,7 @@ export function PushEventDetailPage() {
   // Initialize file selections when repositories and files are loaded.
   // Only run once per push event (or when event/repositories actually change),
   // NOT on every syncJobs poll update, to avoid resetting user selections.
-  const fileInitKey = `${event?.id}:${clientRepos.map((r) => r.id).sort().join(",")}`;
+  const fileInitKey = `${event?.id}:${event?.files?.length || 0}:${clientRepos.map((r) => r.id).sort().join(",")}`;
   useEffect(() => {
     if (fileSelectionInitializedRef.current === fileInitKey) return;
 
@@ -1227,64 +1232,162 @@ export function PushEventDetailPage() {
                       })()}
 
                       {/* List of files status */}
-                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-text-muted">
-                        <span>
-                          <strong className="text-success">DIRECT</strong> file can be copied into the child repo without extra changes.
-                        </span>
-                        <span>
-                          <strong className="text-accent">AUTO-MERGE</strong> child repo also changed this file, but RepoBridge can combine both versions safely.
-                        </span>
-                        <span>
-                          <strong className="text-warning">CONFLICT</strong> both versions changed the same lines, so you need to choose the final content.
-                        </span>
-                      </div>
-                      <div className="max-w-full overflow-x-auto overscroll-x-contain pb-2 rounded-lg border border-border/60 bg-page/20">
-                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2 min-w-full md:min-w-[720px] lg:min-w-[980px] p-2">
-                          {job.files?.map((file) => {
-                          const isConflict = file.mergeResult === "CONFLICT";
-                          return (
-                            <div
-                              key={file.id}
-                              className={`p-2.5 rounded-lg border text-xs flex flex-col justify-between gap-2 ${
-                                isConflict
-                                  ? "bg-warning/5 border-warning/30 text-warning"
-                                  : file.mergeResult === "CLEAN"
-                                  ? "bg-success/5 border-success/20 text-success"
-                                  : file.mergeResult === "MERGED"
-                                  ? "bg-accent/5 border-accent/20 text-accent"
-                                  : "bg-page/50 border-border text-text-secondary"
-                              }`}
-                            >
-                              <div className="flex items-start justify-between gap-2 min-w-0">
-                                <span className="truncate block font-mono text-3xs" title={file.filePath}>
-                                  {file.filePath}
+                      {(() => {
+                        const jobFiles = job.files || [];
+                        const conflictsCount = jobFiles.filter((f) => f.mergeResult === "CONFLICT").length;
+                        const mergedCount = jobFiles.filter((f) => f.mergeResult === "MERGED").length;
+                        const cleanCount = jobFiles.filter((f) => f.mergeResult === "CLEAN").length;
+
+                        const sortedFiles = [...jobFiles]
+                          .filter((file) => {
+                            if (syncFileFilter === "ALL") return true;
+                            return file.mergeResult === syncFileFilter;
+                          })
+                          .sort((a, b) => {
+                            const score = (result: string | null) => {
+                              if (result === "CONFLICT") return 3;
+                              if (result === "MERGED") return 2;
+                              if (result === "CLEAN") return 1;
+                              return 0;
+                            };
+                            return score(b.mergeResult) - score(a.mergeResult);
+                          });
+
+                        const isShowingAll = showAllFilesMap[job.id] || false;
+                        const displayedFiles = isShowingAll ? sortedFiles : sortedFiles.slice(0, 48);
+                        const hasMoreFiles = sortedFiles.length > 48;
+
+                        return (
+                          <>
+                            <div className="flex flex-wrap items-center justify-between gap-4 pt-2 border-t border-border/40">
+                              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-text-muted">
+                                <span>
+                                  <strong className="text-success">DIRECT</strong> file can be copied into the child repo without extra changes.
                                 </span>
-                                <span className="text-[10px] font-bold uppercase whitespace-nowrap">
-                                  {getFileMergeResultLabel(file)}
+                                <span>
+                                  <strong className="text-accent">AUTO-MERGE</strong> child repo also changed this file, but RepoBridge can combine both versions safely.
+                                </span>
+                                <span>
+                                  <strong className="text-warning">CONFLICT</strong> both versions changed the same lines, so you need to choose the final content.
                                 </span>
                               </div>
 
-                              {isConflict && (
-                                <div className="flex flex-wrap items-center gap-2 mt-1">
-                                  <button
-                                    onClick={() => openResolutionEditor(job, file.filePath, file.conflictDiff)}
-                                    className="text-[10px] font-semibold text-success hover:underline flex items-center gap-0.5 self-start"
-                                  >
-                                    Resolve conflict
-                                  </button>
-                                  <button
-                                    onClick={() => handleExcludeAndRetry(job, file.filePath)}
-                                    className="text-[10px] font-semibold text-accent hover:underline flex items-center gap-0.5 self-start"
-                                  >
-                                    Exclude file & retry
-                                  </button>
+                              <div className="flex items-center gap-1 bg-page/80 p-0.5 rounded-lg border border-border">
+                                <button
+                                  type="button"
+                                  onClick={() => setSyncFileFilter("ALL")}
+                                  className={`px-2.5 py-1 rounded-md text-3xs font-semibold transition-all ${
+                                    syncFileFilter === "ALL"
+                                      ? "bg-card text-text-primary shadow-sm"
+                                      : "text-text-muted hover:text-text-secondary"
+                                  }`}
+                                >
+                                  All ({jobFiles.length})
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setSyncFileFilter("CONFLICT")}
+                                  className={`px-2.5 py-1 rounded-md text-3xs font-semibold transition-all ${
+                                    syncFileFilter === "CONFLICT"
+                                      ? "bg-warning/10 text-warning border border-warning/10 shadow-sm"
+                                      : "text-text-muted hover:text-text-secondary"
+                                  }`}
+                                >
+                                  Conflicts ({conflictsCount})
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setSyncFileFilter("MERGED")}
+                                  className={`px-2.5 py-1 rounded-md text-3xs font-semibold transition-all ${
+                                    syncFileFilter === "MERGED"
+                                      ? "bg-accent/10 text-accent border border-accent/10 shadow-sm"
+                                      : "text-text-muted hover:text-text-secondary"
+                                  }`}
+                                >
+                                  Auto-Merge ({mergedCount})
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setSyncFileFilter("CLEAN")}
+                                  className={`px-2.5 py-1 rounded-md text-3xs font-semibold transition-all ${
+                                    syncFileFilter === "CLEAN"
+                                      ? "bg-success/10 text-success border border-success/10 shadow-sm"
+                                      : "text-text-muted hover:text-text-secondary"
+                                  }`}
+                                >
+                                  Direct ({cleanCount})
+                                </button>
+                              </div>
+                            </div>
+
+                            <div className="max-w-full overflow-x-auto overscroll-x-contain pb-2 rounded-lg border border-border/60 bg-page/20">
+                              {displayedFiles.length > 0 ? (
+                                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2 min-w-full md:min-w-[720px] lg:min-w-[980px] p-2">
+                                  {displayedFiles.map((file) => {
+                                    const isConflict = file.mergeResult === "CONFLICT";
+                                    return (
+                                      <div
+                                        key={file.id}
+                                        className={`p-2.5 rounded-lg border text-xs flex flex-col justify-between gap-2 ${
+                                          isConflict
+                                            ? "bg-warning/5 border-warning/30 text-warning"
+                                            : file.mergeResult === "CLEAN"
+                                            ? "bg-success/5 border-success/20 text-success"
+                                            : file.mergeResult === "MERGED"
+                                            ? "bg-accent/5 border-accent/20 text-accent"
+                                            : "bg-page/50 border-border text-text-secondary"
+                                        }`}
+                                      >
+                                        <div className="flex items-start justify-between gap-2 min-w-0">
+                                          <span className="truncate block font-mono text-3xs" title={file.filePath}>
+                                            {file.filePath}
+                                          </span>
+                                          <span className="text-[10px] font-bold uppercase whitespace-nowrap">
+                                            {getFileMergeResultLabel(file)}
+                                          </span>
+                                        </div>
+
+                                        {isConflict && (
+                                          <div className="flex flex-wrap items-center gap-2 mt-1">
+                                            <button
+                                              onClick={() => openResolutionEditor(job, file.filePath, file.conflictDiff)}
+                                              className="text-[10px] font-semibold text-success hover:underline flex items-center gap-0.5 self-start"
+                                            >
+                                              Resolve conflict
+                                            </button>
+                                            <button
+                                              onClick={() => handleExcludeAndRetry(job, file.filePath)}
+                                              className="text-[10px] font-semibold text-accent hover:underline flex items-center gap-0.5 self-start"
+                                            >
+                                              Exclude file & retry
+                                            </button>
+                                          </div>
+                                        )}
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              ) : (
+                                <div className="p-6 text-center text-text-muted text-xs italic">
+                                  No files matching the "{syncFileFilter.toLowerCase()}" filter.
                                 </div>
                               )}
                             </div>
-                          );
-                          })}
-                        </div>
-                      </div>
+
+                            {hasMoreFiles && (
+                              <div className="pt-1 flex justify-center">
+                                <Button
+                                  variant="secondary"
+                                  onClick={() => setShowAllFilesMap((prev) => ({ ...prev, [job.id]: !isShowingAll }))}
+                                  className="text-3xs h-7 px-3.5 flex items-center gap-1"
+                                >
+                                  {isShowingAll ? "Show Less" : `Show All ${sortedFiles.length} Files`}
+                                </Button>
+                              </div>
+                            )}
+                          </>
+                        );
+                      })()}
 
                         {/* Conflict Diff Box */}
                         {job.files?.map((file) => {

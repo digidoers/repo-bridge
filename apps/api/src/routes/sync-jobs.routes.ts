@@ -25,19 +25,37 @@ syncJobsRouter.post("/manual-sync", async (req: Request, res: Response, next: Ne
       commitSha,
       commitShas,
       filePaths,
+      syncMode,
+      baseBranch,
+      compareBranch,
     } = req.body as {
       mainRepoId: string;
       targetRepoIds: string[];
       commitSha?: string;
       commitShas?: string[];
       filePaths: string[];
+      syncMode?: "commits" | "branch";
+      baseBranch?: string;
+      compareBranch?: string;
     };
 
-    const selectedCommitShas = Array.from(new Set(commitShas?.length ? commitShas : commitSha ? [commitSha] : []));
+    const isBranchSync = syncMode === "branch";
 
-    if (!mainRepoId || selectedCommitShas.length === 0) {
-      return next(AppError.badRequest("mainRepoId and at least one commit are required"));
+    if (!mainRepoId) {
+      return next(AppError.badRequest("mainRepoId is required"));
     }
+
+    if (isBranchSync) {
+      if (!compareBranch) {
+        return next(AppError.badRequest("compareBranch is required for branch sync"));
+      }
+    } else {
+      const selectedCommitShas = Array.from(new Set(commitShas?.length ? commitShas : commitSha ? [commitSha] : []));
+      if (selectedCommitShas.length === 0) {
+        return next(AppError.badRequest("At least one commit is required"));
+      }
+    }
+
     if (!Array.isArray(targetRepoIds) || targetRepoIds.length === 0) {
       return next(AppError.badRequest("Select at least one child repository"));
     }
@@ -69,50 +87,14 @@ syncJobsRouter.post("/manual-sync", async (req: Request, res: Response, next: Ne
       return next(AppError.badRequest("Every selected child repository must be active and registered"));
     }
 
-    const branchCommits: GithubCommitSummary[] = [];
-    let commitsPage = 1;
-    let hasNextCommitPage = true;
-    while (hasNextCommitPage && commitsPage <= 20) {
-      const pageResult = await GithubAppService.listCommits(
-        mainRepo.installationId,
-        mainRepo.fullName,
-        mainRepo.branch,
-        { page: commitsPage, pageSize: 50 }
-      );
-      branchCommits.push(...pageResult.items);
-      hasNextCommitPage = pageResult.hasNextPage;
-      commitsPage += 1;
+    let baseSha: string;
+    let headSha: string;
+    let authorName: string;
+    let authorEmail: string;
+    let date: string;
+    let newestCommitMessage: string;
+    let message: string;
 
-      if (selectedCommitShas.every((sha) => branchCommits.some((commit) => commit.sha === sha))) {
-        break;
-      }
-    }
-    const selectedIndexes = selectedCommitShas.map((sha) => branchCommits.findIndex((commit) => commit.sha === sha));
-
-    if (selectedIndexes.some((index) => index === -1)) {
-      return next(AppError.badRequest("Every selected commit must exist in the configured main branch commit list"));
-    }
-
-    const newestIndex = Math.min(...selectedIndexes);
-    const oldestIndex = Math.max(...selectedIndexes);
-    const rangeCommits = branchCommits.slice(newestIndex, oldestIndex + 1);
-    const rangeCommitShas = rangeCommits.map((commit) => commit.sha);
-
-    if (rangeCommitShas.length !== selectedCommitShas.length || !rangeCommitShas.every((sha) => selectedCommitShas.includes(sha))) {
-      return next(AppError.badRequest("Selected commits must be contiguous. Select every commit between the oldest and newest commit."));
-    }
-
-    const newestCommit = await GithubAppService.getCommit(
-      mainRepo.installationId,
-      mainRepo.fullName,
-      rangeCommits[0].sha
-    );
-    const oldestCommit = await GithubAppService.getCommit(
-      mainRepo.installationId,
-      mainRepo.fullName,
-      rangeCommits[rangeCommits.length - 1].sha
-    );
-    const selectedFiles = Array.from(new Set(filePaths));
     const filesByPath = new Map<string, {
       filename: string;
       status: string;
@@ -121,79 +103,174 @@ syncJobsRouter.post("/manual-sync", async (req: Request, res: Response, next: Ne
       deletions: number;
     }>();
 
-    for (const summary of rangeCommits) {
-      const commit = await GithubAppService.getCommit(
+    if (isBranchSync) {
+      const branchTip = await GithubAppService.getCommit(
         mainRepo.installationId,
         mainRepo.fullName,
-        summary.sha
+        compareBranch!
       );
 
-      for (const file of commit.files) {
-        const existing = filesByPath.get(file.filename);
-        filesByPath.set(file.filename, {
-          filename: file.filename,
-          status: existing?.status || file.status,
-          patch: existing?.patch || file.patch,
-          additions: (existing?.additions || 0) + file.additions,
-          deletions: (existing?.deletions || 0) + file.deletions,
-        });
+      baseSha = "HEAD";
+      headSha = branchTip.sha;
+      authorName = branchTip.authorName;
+      authorEmail = branchTip.authorEmail;
+      date = branchTip.date;
+      newestCommitMessage = branchTip.message;
+      message = `Branch sync: ${compareBranch} - ${newestCommitMessage.split("\n")[0]}`;
+    } else {
+      const selectedCommitShas = Array.from(new Set(commitShas?.length ? commitShas : commitSha ? [commitSha] : []));
+      const branchCommits: GithubCommitSummary[] = [];
+      let commitsPage = 1;
+      let hasNextCommitPage = true;
+      while (hasNextCommitPage && commitsPage <= 20) {
+        const pageResult = await GithubAppService.listCommits(
+          mainRepo.installationId,
+          mainRepo.fullName,
+          mainRepo.branch,
+          { page: commitsPage, pageSize: 50 }
+        );
+        branchCommits.push(...pageResult.items);
+        hasNextCommitPage = pageResult.hasNextPage;
+        commitsPage += 1;
+
+        if (selectedCommitShas.every((sha) => branchCommits.some((commit) => commit.sha === sha))) {
+          break;
+        }
+      }
+
+      // Filter out commits that do not exist in the branch
+      const validCommitShas = selectedCommitShas.filter((sha) =>
+        branchCommits.some((commit) => commit.sha === sha)
+      );
+
+      if (validCommitShas.length === 0) {
+        return next(AppError.badRequest("None of the selected commits exist in the configured main branch commit list"));
+      }
+
+      const selectedIndexes = validCommitShas.map((sha) => branchCommits.findIndex((commit) => commit.sha === sha));
+
+      const newestIndex = Math.min(...selectedIndexes);
+      const oldestIndex = Math.max(...selectedIndexes);
+      const rangeCommits = branchCommits.slice(newestIndex, oldestIndex + 1);
+      const rangeCommitShas = rangeCommits.map((commit) => commit.sha);
+
+      if (rangeCommitShas.length !== validCommitShas.length || !rangeCommitShas.every((sha) => validCommitShas.includes(sha))) {
+        return next(AppError.badRequest("Selected commits must be contiguous. Select every commit between the oldest and newest commit."));
+      }
+
+      const newestCommit = await GithubAppService.getCommit(
+        mainRepo.installationId,
+        mainRepo.fullName,
+        rangeCommits[0].sha
+      );
+      const oldestCommit = await GithubAppService.getCommit(
+        mainRepo.installationId,
+        mainRepo.fullName,
+        rangeCommits[rangeCommits.length - 1].sha
+      );
+
+      baseSha = oldestCommit.parentSha;
+      headSha = newestCommit.sha;
+      authorName = newestCommit.authorName;
+      authorEmail = newestCommit.authorEmail;
+      date = newestCommit.date;
+      newestCommitMessage = newestCommit.message;
+      message = rangeCommits.length === 1
+        ? newestCommitMessage
+        : `Manual sync range: ${rangeCommits.length} commits from ${oldestCommit.sha.substring(0, 7)} to ${newestCommit.sha.substring(0, 7)}`;
+
+      for (const summary of rangeCommits) {
+        const commit = await GithubAppService.getCommit(
+          mainRepo.installationId,
+          mainRepo.fullName,
+          summary.sha
+        );
+
+        for (const file of commit.files) {
+          const existing = filesByPath.get(file.filename);
+          filesByPath.set(file.filename, {
+            filename: file.filename,
+            status: existing?.status || file.status,
+            patch: existing?.patch || file.patch,
+            additions: (existing?.additions || 0) + file.additions,
+            deletions: (existing?.deletions || 0) + file.deletions,
+          });
+        }
       }
     }
 
-    const validFilePaths = new Set(filesByPath.keys());
-    const invalidFiles = selectedFiles.filter((filePath) => !validFilePaths.has(filePath));
+    let selectedFiles: string[] = [];
+    let selectedCommitFiles: Array<{
+      filename: string;
+      status: string;
+      patch?: string;
+      additions: number;
+      deletions: number;
+    }> = [];
 
-    if (invalidFiles.length > 0) {
-      return next(AppError.badRequest(`Selected files are not part of the selected commit range: ${invalidFiles.join(", ")}`));
+    if (isBranchSync) {
+      selectedFiles = ["*"];
+      selectedCommitFiles = [{
+        filename: "*",
+        status: "modified",
+        patch: "",
+        additions: 0,
+        deletions: 0,
+      }];
+    } else {
+      selectedFiles = Array.from(new Set(filePaths));
+      const validFilePaths = new Set(filesByPath.keys());
+      const invalidFiles = selectedFiles.filter((filePath) => !validFilePaths.has(filePath));
+
+      if (invalidFiles.length > 0) {
+        return next(AppError.badRequest(`Selected files are not part of the selected commit range: ${invalidFiles.join(", ")}`));
+      }
+
+      selectedCommitFiles = selectedFiles
+        .map((filePath) => filesByPath.get(filePath))
+        .filter((file): file is {
+          filename: string;
+          status: string;
+          patch?: string;
+          additions: number;
+          deletions: number;
+        } => Boolean(file));
     }
-
-    const selectedCommitFiles = selectedFiles
-      .map((filePath) => filesByPath.get(filePath))
-      .filter((file): file is {
-        filename: string;
-        status: string;
-        patch?: string;
-        additions: number;
-        deletions: number;
-      } => Boolean(file));
     const pushEvent = await prisma.$transaction(async (tx) => {
-      const message = rangeCommits.length === 1
-        ? newestCommit.message
-        : `Manual sync range: ${rangeCommits.length} commits from ${oldestCommit.sha.substring(0, 7)} to ${newestCommit.sha.substring(0, 7)}`;
       const existing = await tx.pushEvent.findFirst({
         where: {
           repositoryId: mainRepo.id,
-          commitSha: newestCommit.sha,
+          commitSha: headSha,
         },
       });
 
       const event = existing
         ? await tx.pushEvent.update({
-            where: { id: existing.id },
-            data: {
-              repositoryId: mainRepo.id,
-              baseSha: oldestCommit.parentSha,
-              branch: mainRepo.branch,
-              authorName: newestCommit.authorName,
-              authorEmail: newestCommit.authorEmail,
-              message,
-              pushedAt: new Date(newestCommit.date),
-              status: "TRIAGED",
-            },
-          })
+          where: { id: existing.id },
+          data: {
+            repositoryId: mainRepo.id,
+            baseSha,
+            branch: isBranchSync ? compareBranch! : mainRepo.branch,
+            authorName,
+            authorEmail,
+            message,
+            pushedAt: new Date(date),
+            status: "TRIAGED",
+          },
+        })
         : await tx.pushEvent.create({
-            data: {
-              repositoryId: mainRepo.id,
-              commitSha: newestCommit.sha,
-              baseSha: oldestCommit.parentSha,
-              branch: mainRepo.branch,
-              authorName: newestCommit.authorName,
-              authorEmail: newestCommit.authorEmail,
-              message,
-              pushedAt: new Date(newestCommit.date),
-              status: "TRIAGED",
-            },
-          });
+          data: {
+            repositoryId: mainRepo.id,
+            commitSha: headSha,
+            baseSha,
+            branch: isBranchSync ? compareBranch! : mainRepo.branch,
+            authorName,
+            authorEmail,
+            message,
+            pushedAt: new Date(date),
+            status: "TRIAGED",
+          },
+        });
 
       await tx.pushFile.deleteMany({
         where: { pushEventId: event.id },
