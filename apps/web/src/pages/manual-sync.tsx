@@ -164,7 +164,7 @@ export function ManualSyncPage() {
   });
 
   const manualSyncMutation = useMutation({
-    mutationFn: () =>
+    mutationFn: (options?: { autoResolveStrategy?: "current" | "incoming" | "both"; autoMerge?: boolean }) =>
       api.createManualSync({
         mainRepoId,
         targetRepoIds,
@@ -173,9 +173,15 @@ export function ManualSyncPage() {
         syncMode,
         baseBranch: syncMode === "branch" ? defaultBranch : undefined,
         compareBranch: syncMode === "branch" ? mainBranch : undefined,
+        autoResolveStrategy: options?.autoResolveStrategy,
+        autoMerge: options?.autoMerge,
       }),
-    onSuccess: (data) => {
-      toast.success("Review page prepared. Dry-run check is running.");
+    onSuccess: (data, variables) => {
+      if (variables?.autoResolveStrategy) {
+        toast.success(`Direct Branch Sync started with strategy: ${variables.autoResolveStrategy === "current" ? "Accept Target" : variables.autoResolveStrategy === "incoming" ? "Accept Source" : "Keep Both"}`);
+      } else {
+        toast.success("Review page prepared. Dry-run check is running.");
+      }
       queryClient.removeQueries({ queryKey: ["sync-jobs", data.pushEvent.id] });
       queryClient.invalidateQueries({ queryKey: ["push-event", data.pushEvent.id] });
       queryClient.invalidateQueries({ queryKey: ["push-events-dashboard"] });
@@ -187,6 +193,16 @@ export function ManualSyncPage() {
       toast.error(msg);
     },
   });
+
+  const selectedChildRepos = childRepos.filter((repo) => targetRepoIds.includes(repo.id));
+  const childRepoLabel =
+    selectedChildRepos.length === 1
+      ? selectedChildRepos[0].customerName || selectedChildRepos[0].githubName
+      : selectedChildRepos.length > 1
+      ? `${selectedChildRepos[0].customerName || selectedChildRepos[0].githubName} +${selectedChildRepos.length - 1}`
+      : "Child Repos";
+
+  const parentRepoLabel = selectedMainRepo?.customerName || selectedMainRepo?.githubName || "Parent Repo";
 
   const canContinueFromRepos = !!mainRepoId && !!mainBranch && targetRepoIds.length > 0;
   const canContinueFromCommit =
@@ -748,7 +764,7 @@ export function ManualSyncPage() {
                 </>
               )}
             </p>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               {syncMode === "commits" && commitShas.length > 0 && (
                 <Button
                   type="button"
@@ -759,33 +775,58 @@ export function ManualSyncPage() {
                   Clear selected
                 </Button>
               )}
-              <Button
-                disabled={syncMode === "branch" ? !mainBranch || manualSyncMutation.isPending : !canContinueFromCommit}
-                onClick={() => {
-                  if (syncMode === "branch") {
-                    manualSyncMutation.mutate();
-                  } else {
-                    setStep(3);
-                  }
-                }}
-                className="text-xs flex items-center gap-1.5"
-              >
-                {syncMode === "branch" ? (
-                  <>
+
+              {syncMode === "branch" ? (
+                <>
+                  <Button
+                    type="button"
+                    onClick={() => manualSyncMutation.mutate({ autoResolveStrategy: "current", autoMerge: true })}
+                    disabled={!mainBranch || manualSyncMutation.isPending}
+                    className="text-xs bg-red-500/20 hover:bg-red-500/30 text-red-300 border border-red-500/30 font-semibold"
+                  >
+                    Auto-Sync & Accept Target ({childRepoLabel})
+                  </Button>
+                  <Button
+                    type="button"
+                    onClick={() => manualSyncMutation.mutate({ autoResolveStrategy: "incoming", autoMerge: true })}
+                    disabled={!mainBranch || manualSyncMutation.isPending}
+                    className="text-xs bg-blue-500/20 hover:bg-blue-500/30 text-blue-300 border border-blue-500/30 font-semibold"
+                  >
+                    Auto-Sync & Accept Source ({parentRepoLabel})
+                  </Button>
+                  <Button
+                    type="button"
+                    onClick={() => manualSyncMutation.mutate({ autoResolveStrategy: "both", autoMerge: true })}
+                    disabled={!mainBranch || manualSyncMutation.isPending}
+                    variant="secondary"
+                    className="text-xs"
+                  >
+                    Auto-Sync & Keep Both
+                  </Button>
+                  <Button
+                    type="button"
+                    disabled={!mainBranch || manualSyncMutation.isPending}
+                    onClick={() => manualSyncMutation.mutate(undefined)}
+                    className="text-xs flex items-center gap-1.5"
+                  >
                     Proceed to Review
                     {manualSyncMutation.isPending ? (
                       <Loader2 className="w-3.5 h-3.5 animate-spin" />
                     ) : (
                       <ArrowRight className="w-3.5 h-3.5" />
                     )}
-                  </>
-                ) : (
-                  <>
-                    Continue to Files
-                    <ArrowRight className="w-3.5 h-3.5" />
-                  </>
-                )}
-              </Button>
+                  </Button>
+                </>
+              ) : (
+                <Button
+                  disabled={!canContinueFromCommit}
+                  onClick={() => setStep(3)}
+                  className="text-xs flex items-center gap-1.5"
+                >
+                  Continue to Files
+                  <ArrowRight className="w-3.5 h-3.5" />
+                </Button>
+              )}
             </div>
           </div>
         </section>
@@ -869,7 +910,7 @@ export function ManualSyncPage() {
             </p>
             <Button
               disabled={!canProceedToReview}
-              onClick={() => manualSyncMutation.mutate()}
+              onClick={() => manualSyncMutation.mutate(undefined)}
               className="text-xs flex items-center gap-1.5 bg-accent hover:bg-accent-hover text-white"
             >
               {manualSyncMutation.isPending ? (

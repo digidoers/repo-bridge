@@ -205,6 +205,8 @@ export interface ManualSyncRequest {
   syncMode?: "commits" | "branch";
   baseBranch?: string;
   compareBranch?: string;
+  autoResolveStrategy?: "current" | "incoming" | "both";
+  autoMerge?: boolean;
 }
 
 export interface ManualSyncResponse {

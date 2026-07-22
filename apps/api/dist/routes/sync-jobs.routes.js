@@ -14,7 +14,7 @@ syncJobsRouter.use(authenticate);
  */
 syncJobsRouter.post("/manual-sync", async (req, res, next) => {
     try {
-        const { mainRepoId, targetRepoIds, commitSha, commitShas, filePaths, syncMode, baseBranch, compareBranch, } = req.body;
+        const { mainRepoId, targetRepoIds, commitSha, commitShas, filePaths, syncMode, baseBranch, compareBranch, autoResolveStrategy, autoMerge, } = req.body;
         const isBranchSync = syncMode === "branch";
         if (!mainRepoId) {
             return next(AppError.badRequest("mainRepoId is required"));
@@ -237,7 +237,7 @@ syncJobsRouter.post("/manual-sync", async (req, res, next) => {
                 },
             });
             createdJobs.push(syncJob);
-            syncQueue.enqueueDryRun(syncJob.id);
+            syncQueue.enqueueDryRun(syncJob.id, { autoResolveStrategy, autoMerge });
         }
         res.status(201).json({
             ok: true,

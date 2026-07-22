@@ -207,7 +207,60 @@ function parseUnifiedDiff(diffOutput: string): Map<string, string> {
   return filePatches;
 }
 
+function applyConflictChoiceToDiff(content: string, choice: "current" | "incoming" | "both"): string {
+  if (!content) return "";
+  const lines = content.split("\n");
+  const resolved: string[] = [];
+  let mode: "normal" | "current" | "base" | "incoming" = "normal";
+  let current: string[] = [];
+  let incoming: string[] = [];
+
+  for (const line of lines) {
+    if (line.startsWith("<<<<<<<")) {
+      mode = "current";
+      current = [];
+      incoming = [];
+      continue;
+    }
+    if (mode === "current" && line.startsWith("|||||||")) {
+      mode = "base";
+      continue;
+    }
+    if (mode === "base" && line.startsWith("=======")) {
+      mode = "incoming";
+      continue;
+    }
+    if (mode === "current" && line.startsWith("=======")) {
+      mode = "incoming";
+      continue;
+    }
+    if (mode === "incoming" && line.startsWith(">>>>>>>")) {
+      if (choice === "current") resolved.push(...current);
+      if (choice === "incoming") resolved.push(...incoming);
+      if (choice === "both") resolved.push(...current, ...incoming);
+      mode = "normal";
+      continue;
+    }
+    if (mode === "current") {
+      current.push(line);
+    } else if (mode === "base") {
+      continue;
+    } else if (mode === "incoming") {
+      incoming.push(line);
+    } else {
+      resolved.push(line);
+    }
+  }
+
+  return resolved.join("\n");
+}
+
 type ApplyOptions = {
+  autoMerge?: boolean;
+};
+
+type DryRunOptions = {
+  autoResolveStrategy?: "current" | "incoming" | "both";
   autoMerge?: boolean;
 };
 
@@ -219,13 +272,13 @@ class SyncQueue {
   /**
    * Enqueues a sync job to run its dry-run analysis in the background.
    */
-  public enqueueDryRun(syncJobId: string) {
+  public enqueueDryRun(syncJobId: string, options: DryRunOptions = {}) {
     setImmediate(async () => {
-      await this.processDryRun(syncJobId);
+      await this.processDryRun(syncJobId, options);
     });
   }
 
-  private async processDryRun(syncJobId: string) {
+  private async processDryRun(syncJobId: string, options: DryRunOptions = {}) {
     if (this.activeJobs.has(syncJobId)) return;
     this.activeJobs.add(syncJobId);
 
@@ -261,7 +314,7 @@ class SyncQueue {
         throw new Error("GitHub App is not configured. Dry-run requires real repository access.");
       }
 
-      await this.runRealDryRun(job);
+      await this.runRealDryRun(job, options);
     } catch (err: any) {
       console.error(`[SyncQueue] Unexpected error in SyncJob ${syncJobId}:`, err);
       await prisma.syncJob.update({
@@ -276,7 +329,7 @@ class SyncQueue {
     }
   }
 
-  private async runRealDryRun(job: any) {
+  private async runRealDryRun(job: any, options: DryRunOptions = {}) {
     console.log(`[SyncQueue] Running Real Dry-Run for SyncJob ${job.id}`);
 
     const jobId = job.id;
@@ -463,6 +516,25 @@ class SyncQueue {
         }
       }
 
+      if (options.autoResolveStrategy) {
+        const conflictFiles = await prisma.syncJobFile.findMany({
+          where: { syncJobId: job.id, mergeResult: "CONFLICT" },
+        });
+
+        for (const file of conflictFiles) {
+          if (file.conflictDiff) {
+            const resolvedText = applyConflictChoiceToDiff(file.conflictDiff, options.autoResolveStrategy);
+            await prisma.syncJobFile.update({
+              where: { id: file.id },
+              data: {
+                mergeResult: "MERGED",
+                conflictDiff: `${RESOLVED_CONTENT_PREFIX}${resolvedText}`,
+              },
+            });
+          }
+        }
+      }
+
       const updatedJobFiles = await prisma.syncJobFile.findMany({
         where: { syncJobId: job.id },
       });
@@ -478,6 +550,11 @@ class SyncQueue {
       });
 
       console.log(`[SyncQueue] Dry-Run completed for SyncJob ${job.id} with status ${finalStatus}`);
+
+      if (finalStatus === "CLEAN" && options.autoMerge) {
+        console.log(`[SyncQueue] Auto-Merge requested for SyncJob ${job.id}, triggering processApply`);
+        this.enqueueApply(job.id, { autoMerge: true });
+      }
     } catch (err: any) {
       console.error(`[SyncQueue] Error during dry-run for SyncJob ${job.id}:`, err);
       throw err;

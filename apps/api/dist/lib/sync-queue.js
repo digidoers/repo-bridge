@@ -175,18 +175,70 @@ function parseUnifiedDiff(diffOutput) {
     }
     return filePatches;
 }
+function applyConflictChoiceToDiff(content, choice) {
+    if (!content)
+        return "";
+    const lines = content.split("\n");
+    const resolved = [];
+    let mode = "normal";
+    let current = [];
+    let incoming = [];
+    for (const line of lines) {
+        if (line.startsWith("<<<<<<<")) {
+            mode = "current";
+            current = [];
+            incoming = [];
+            continue;
+        }
+        if (mode === "current" && line.startsWith("|||||||")) {
+            mode = "base";
+            continue;
+        }
+        if (mode === "base" && line.startsWith("=======")) {
+            mode = "incoming";
+            continue;
+        }
+        if (mode === "current" && line.startsWith("=======")) {
+            mode = "incoming";
+            continue;
+        }
+        if (mode === "incoming" && line.startsWith(">>>>>>>")) {
+            if (choice === "current")
+                resolved.push(...current);
+            if (choice === "incoming")
+                resolved.push(...incoming);
+            if (choice === "both")
+                resolved.push(...current, ...incoming);
+            mode = "normal";
+            continue;
+        }
+        if (mode === "current") {
+            current.push(line);
+        }
+        else if (mode === "base") {
+            continue;
+        }
+        else if (mode === "incoming") {
+            incoming.push(line);
+        }
+        else {
+            resolved.push(line);
+        }
+    }
+    return resolved.join("\n");
+}
 const RESOLVED_CONTENT_PREFIX = "repo-sync:resolved-content:v1\n";
 class SyncQueue {
     activeJobs = new Set();
     /**
      * Enqueues a sync job to run its dry-run analysis in the background.
      */
-    enqueueDryRun(syncJobId) {
+    enqueueDryRun(syncJobId, options = {}) {
         setImmediate(async () => {
-            await this.processDryRun(syncJobId);
+            await this.processDryRun(syncJobId, options);
         });
     }
-    async processDryRun(syncJobId) {
+    async processDryRun(syncJobId, options = {}) {
         if (this.activeJobs.has(syncJobId))
             return;
         this.activeJobs.add(syncJobId);
@@ -217,7 +269,7 @@ class SyncQueue {
             if (await GithubAppService.isMockMode()) {
                 throw new Error("GitHub App is not configured. Dry-run requires real repository access.");
             }
-            await this.runRealDryRun(job);
+            await this.runRealDryRun(job, options);
         }
         catch (err) {
             console.error(`[SyncQueue] Unexpected error in SyncJob ${syncJobId}:`, err);
@@ -233,7 +285,7 @@ class SyncQueue {
             this.activeJobs.delete(syncJobId);
         }
     }
-    async runRealDryRun(job) {
+    async runRealDryRun(job, options = {}) {
         console.log(`[SyncQueue] Running Real Dry-Run for SyncJob ${job.id}`);
         const jobId = job.id;
         const tempDir = path.join(process.cwd(), "temp-jobs", jobId);
@@ -384,6 +436,23 @@ class SyncQueue {
                     await prisma.$transaction(chunk);
                 }
             }
+            if (options.autoResolveStrategy) {
+                const conflictFiles = await prisma.syncJobFile.findMany({
+                    where: { syncJobId: job.id, mergeResult: "CONFLICT" },
+                });
+                for (const file of conflictFiles) {
+                    if (file.conflictDiff) {
+                        const resolvedText = applyConflictChoiceToDiff(file.conflictDiff, options.autoResolveStrategy);
+                        await prisma.syncJobFile.update({
+                            where: { id: file.id },
+                            data: {
+                                mergeResult: "MERGED",
+                                conflictDiff: `${RESOLVED_CONTENT_PREFIX}${resolvedText}`,
+                            },
+                        });
+                    }
+                }
+            }
             const updatedJobFiles = await prisma.syncJobFile.findMany({
                 where: { syncJobId: job.id },
             });
@@ -397,6 +466,10 @@ class SyncQueue {
                 },
             });
             console.log(`[SyncQueue] Dry-Run completed for SyncJob ${job.id} with status ${finalStatus}`);
+            if (finalStatus === "CLEAN" && options.autoMerge) {
+                console.log(`[SyncQueue] Auto-Merge requested for SyncJob ${job.id}, triggering processApply`);
+                this.enqueueApply(job.id, { autoMerge: true });
+            }
         }
         catch (err) {
             console.error(`[SyncQueue] Error during dry-run for SyncJob ${job.id}:`, err);

@@ -28,6 +28,8 @@ syncJobsRouter.post("/manual-sync", async (req: Request, res: Response, next: Ne
       syncMode,
       baseBranch,
       compareBranch,
+      autoResolveStrategy,
+      autoMerge,
     } = req.body as {
       mainRepoId: string;
       targetRepoIds: string[];
@@ -37,6 +39,8 @@ syncJobsRouter.post("/manual-sync", async (req: Request, res: Response, next: Ne
       syncMode?: "commits" | "branch";
       baseBranch?: string;
       compareBranch?: string;
+      autoResolveStrategy?: "current" | "incoming" | "both";
+      autoMerge?: boolean;
     };
 
     const isBranchSync = syncMode === "branch";
@@ -332,7 +336,7 @@ syncJobsRouter.post("/manual-sync", async (req: Request, res: Response, next: Ne
       });
 
       createdJobs.push(syncJob);
-      syncQueue.enqueueDryRun(syncJob.id);
+      syncQueue.enqueueDryRun(syncJob.id, { autoResolveStrategy, autoMerge });
     }
 
     res.status(201).json({
