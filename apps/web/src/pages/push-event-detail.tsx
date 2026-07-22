@@ -1322,16 +1322,16 @@ export function PushEventDetailPage() {
 
                             <div className="max-w-full overflow-hidden rounded-lg border border-border/60 bg-page/20">
                               {displayedFiles.length > 0 ? (
-                                <div className="max-h-[280px] overflow-y-auto overflow-x-hidden p-2">
-                                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-2">
+                                <div className="max-h-[220px] overflow-y-auto overflow-x-hidden p-2 custom-scrollbar">
+                                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-4 xl:grid-cols-5 gap-2">
                                     {displayedFiles.map((file) => {
                                       const isConflict = file.mergeResult === "CONFLICT";
                                       return (
                                         <div
                                           key={file.id}
-                                          className={`p-2.5 rounded-lg border text-xs flex flex-col justify-between gap-1.5 transition-all ${
+                                          className={`p-2 rounded-lg border text-xs flex flex-col justify-between gap-1 transition-all ${
                                             isConflict
-                                              ? "bg-warning/5 border-warning/30 text-warning"
+                                              ? "bg-warning/10 border-warning/40 text-warning"
                                               : file.mergeResult === "CLEAN"
                                               ? "bg-success/5 border-success/20 text-success"
                                               : file.mergeResult === "MERGED"
@@ -1339,26 +1339,26 @@ export function PushEventDetailPage() {
                                               : "bg-page/50 border-border text-text-secondary"
                                           }`}
                                         >
-                                          <div className="flex items-start justify-between gap-1.5 min-w-0">
-                                            <span className="truncate block font-mono text-3xs font-medium" title={file.filePath}>
+                                          <div className="flex items-start justify-between gap-1 min-w-0">
+                                            <span className="truncate block font-mono text-[11px] font-medium" title={file.filePath}>
                                               {file.filePath}
                                             </span>
-                                            <span className="text-[10px] font-bold uppercase whitespace-nowrap flex-shrink-0">
+                                            <span className="text-[9px] font-bold uppercase whitespace-nowrap flex-shrink-0 px-1 py-0.5 rounded bg-page/40">
                                               {getFileMergeResultLabel(file)}
                                             </span>
                                           </div>
 
                                           {isConflict && (
-                                            <div className="flex flex-wrap items-center gap-2 mt-0.5 pt-1 border-t border-warning/20">
+                                            <div className="flex flex-wrap items-center gap-2 mt-0.5 pt-1 border-t border-warning/30 text-[10px]">
                                               <button
                                                 onClick={() => openResolutionEditor(job, file.filePath, file.conflictDiff)}
-                                                className="text-[10px] font-semibold text-success hover:underline flex items-center gap-0.5"
+                                                className="font-semibold text-success hover:underline flex items-center gap-0.5"
                                               >
                                                 Resolve conflict
                                               </button>
                                               <button
                                                 onClick={() => handleExcludeAndRetry(job, file.filePath)}
-                                                className="text-[10px] font-semibold text-accent hover:underline flex items-center gap-0.5"
+                                                className="font-semibold text-accent hover:underline flex items-center gap-0.5"
                                               >
                                                 Exclude & retry
                                               </button>
