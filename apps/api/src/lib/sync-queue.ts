@@ -47,24 +47,121 @@ function formatGitError(err: any) {
  * commit without needing to go through git-apply (which requires the file to already
  * be in the index). Returns the list of paths that were successfully placed.
  */
-function placeFilesFromCommit(
-  missingPaths: string[],
-  commitSha: string,
-  targetDir: string
-): string[] {
-  const placed: string[] = [];
-  for (const filePath of missingPaths) {
-    try {
-      const safePath = safeRepoPath(filePath);
-      // git checkout <sha> -- <path> places the file at commitSha into working tree and index
-      runGit(["checkout", commitSha, "--", safePath], targetDir);
-      placed.push(filePath);
-      console.log(`[SyncQueue] Directly placed missing file from commitSha: ${filePath}`);
-    } catch {
-      // File may have been deleted in commitSha, renamed, or another error — skip it
-    }
+interface FileSyncResult {
+  mergeResult: "CLEAN" | "MERGED" | "CONFLICT";
+  conflictDiff: string | null;
+}
+
+function getFileContentFromRef(ref: string, safePath: string, cwd: string): string | null {
+  try {
+    return execFileSync("git", ["show", `${ref}:${safePath}`], {
+      cwd,
+      encoding: "utf8",
+      maxBuffer: 50 * 1024 * 1024,
+      stdio: "pipe",
+    }) as string;
+  } catch {
+    return null;
   }
-  return placed;
+}
+
+function syncSingleFile(
+  filePath: string,
+  baseRef: string,
+  commitSha: string,
+  targetDir: string,
+  tempDir: string,
+  isDryRun: boolean,
+  savedResolvedContent?: string | null
+): FileSyncResult {
+  const safePath = safeRepoPath(filePath);
+  const fullPath = path.join(targetDir, safePath);
+
+  // 1. If user previously resolved a conflict in UI, write that resolution
+  if (savedResolvedContent && savedResolvedContent.startsWith(RESOLVED_CONTENT_PREFIX)) {
+    const resolvedText = savedResolvedContent.slice(RESOLVED_CONTENT_PREFIX.length);
+    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+    fs.writeFileSync(fullPath, resolvedText, "utf8");
+    if (!isDryRun) {
+      runGit(["add", safePath], targetDir);
+    }
+    return { mergeResult: "MERGED", conflictDiff: null };
+  }
+
+  // 2. Fetch content from upstream base and commit
+  const baseContent = getFileContentFromRef(baseRef, safePath, targetDir);
+  const commitContent = getFileContentFromRef(commitSha, safePath, targetDir);
+  const targetExists = fs.existsSync(fullPath);
+
+  // 3. Upstream deleted the file
+  if (commitContent === null) {
+    if (targetExists) {
+      fs.rmSync(fullPath, { force: true });
+      if (!isDryRun) {
+        try {
+          runGit(["rm", "-f", safePath], targetDir);
+        } catch {}
+      }
+    }
+    return { mergeResult: "CLEAN", conflictDiff: null };
+  }
+
+  // 4. File does not exist in target repository (Brand new file or missing file)
+  if (!targetExists) {
+    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+    fs.writeFileSync(fullPath, commitContent, "utf8");
+    if (!isDryRun) {
+      runGit(["add", safePath], targetDir);
+    }
+    return { mergeResult: "CLEAN", conflictDiff: null };
+  }
+
+  // 5. File exists in target repository
+  const targetContent = fs.readFileSync(fullPath, "utf8");
+
+  // If target file already matches commitContent or baseContent hasn't changed relative to commitContent
+  if (targetContent === commitContent || baseContent === commitContent) {
+    if (!isDryRun) {
+      runGit(["add", safePath], targetDir);
+    }
+    return { mergeResult: "CLEAN", conflictDiff: null };
+  }
+
+  // If target file was not modified since baseSha (targetContent matches baseContent)
+  if (baseContent !== null && targetContent === baseContent) {
+    fs.writeFileSync(fullPath, commitContent, "utf8");
+    if (!isDryRun) {
+      runGit(["add", safePath], targetDir);
+    }
+    return { mergeResult: "CLEAN", conflictDiff: null };
+  }
+
+  // 6. Both target repository and upstream modified the file (or baseContent was missing)
+  // Perform a 3-way merge using git merge-file
+  const fileHash = Buffer.from(safePath).toString("hex").substring(0, 12);
+  const baseTmp = path.join(tempDir, `base-${fileHash}.tmp`);
+  const commitTmp = path.join(tempDir, `commit-${fileHash}.tmp`);
+
+  try {
+    fs.writeFileSync(baseTmp, baseContent || "", "utf8");
+    fs.writeFileSync(commitTmp, commitContent, "utf8");
+
+    try {
+      runGit(["merge-file", fullPath, baseTmp, commitTmp], targetDir);
+      // Clean 3-way merge
+      if (!isDryRun) {
+        runGit(["add", safePath], targetDir);
+      }
+      return { mergeResult: "MERGED", conflictDiff: null };
+    } catch (mergeErr: any) {
+      // Exit status > 0 means git merge-file inserted conflict markers into fullPath
+      const conflictContent = fs.readFileSync(fullPath, "utf8");
+      return { mergeResult: "CONFLICT", conflictDiff: conflictContent };
+    }
+  } finally {
+    try { fs.rmSync(baseTmp, { force: true }); } catch {}
+    try { fs.rmSync(commitTmp, { force: true }); } catch {}
+  }
 }
 
 function sleep(ms: number) {
@@ -102,23 +199,6 @@ function parseUnifiedDiff(diffOutput: string): Map<string, string> {
   }
 
   return filePatches;
-}
-
-/**
- * Returns only files that exist in the target working tree.
- * Files that don't exist in the client repo are handled separately by
- * placeFilesFromCommit(), which places them directly at their final commitSha
- * state. This avoids the fragile git ls-tree baseSha approach (which can
- * silently fail and cause ALL files to bypass the safety filter).
- */
-function getSafeSelectedPaths(selectedPaths: string[], targetDir: string): string[] {
-  return selectedPaths.filter(filePath => {
-    try {
-      return fs.existsSync(path.join(targetDir, safeRepoPath(filePath)));
-    } catch {
-      return false;
-    }
-  });
 }
 
 type ApplyOptions = {
@@ -331,72 +411,34 @@ class SyncQueue {
         selectedPaths = job.files.map((f: any) => f.filePath);
       }
 
-      // Separate files into: those that already exist in the client (patchable)
-      // and those that are missing from the client (must be placed directly).
-      const safePaths = getSafeSelectedPaths(selectedPaths, targetDir);
-      const missingPaths = selectedPaths.filter(p => !safePaths.includes(p));
-
-      // Directly place missing files at their final commitSha state.
-      // This avoids "does not exist in index" errors from git apply.
-      if (missingPaths.length > 0) {
-        console.log(`[SyncQueue] Dry-Run: Placing ${missingPaths.length} missing file(s) directly from commitSha.`);
-        placeFilesFromCommit(missingPaths, job.pushEvent.commitSha, targetDir);
-      }
-
-      // Build patch only for files that already exist in the client repo.
-      const patchFile = path.join(tempDir, "selected.patch");
-      let selectedPatch = "";
-      if (safePaths.length > 0) {
-        selectedPatch = runGit(["diff", "--binary", job.pushEvent.baseSha, job.pushEvent.commitSha, "--", ...safePaths], targetDir);
-      }
-      fs.writeFileSync(patchFile, selectedPatch);
-
-      // 6. Checkout temporary branch for checking
+      // 6. Checkout temporary branch for dry run
       runGit(["checkout", "-b", `dry-run-${jobId}`], targetDir);
 
-      // Bulk diff to identify drifted files in target branch compared to baseSha in a single call
-      const driftedFiles = new Set<string>();
-      try {
-        const diffOutput = runGit(["diff", "--name-only", job.pushEvent.baseSha, "HEAD"], targetDir);
-        diffOutput.split("\n").map(f => f.trim()).filter(Boolean).forEach(f => driftedFiles.add(f));
-      } catch (diffErr) {
-        console.error("Failed to run bulk git diff between baseSha and HEAD:", diffErr);
-      }
-
-      const mergeResultsByFile = new Map<string, "CLEAN" | "MERGED">();
-      for (const jobFile of job.files) {
-        const mergeResult = driftedFiles.has(jobFile.filePath) ? "MERGED" : "CLEAN";
-        mergeResultsByFile.set(jobFile.filePath, mergeResult);
-      }
-
-      // 7. Simulate the exact apply operation used by real merge.
-      try {
-        runGit(["apply", "--3way", "--whitespace=nowarn", patchFile], targetDir);
-      } catch (applyErr) {
-        // Ignore here; conflict markers in the temp worktree are inspected below.
-      }
-
+      const baseRef = job.pushEvent.baseSha === "HEAD" ? `${job.pushEvent.commitSha}~1` : job.pushEvent.baseSha;
       let hasConflict = false;
       const jobFileUpdates = [];
 
       for (const jobFile of job.files) {
-        const filePathOnDisk = path.join(targetDir, jobFile.filePath);
-        let mergeResult: "CLEAN" | "MERGED" | "CONFLICT" = mergeResultsByFile.get(jobFile.filePath) || "CLEAN";
-        let conflictDiff: string | null = null;
+        const syncRes = syncSingleFile(
+          jobFile.filePath,
+          baseRef,
+          job.pushEvent.commitSha,
+          targetDir,
+          tempDir,
+          true // isDryRun = true
+        );
 
-        if (fs.existsSync(filePathOnDisk)) {
-          const content = fs.readFileSync(filePathOnDisk, "utf8");
-          if (content.includes("<<<<<<<") && content.includes("=======") && content.includes(">>>>>>>")) {
-            mergeResult = "CONFLICT";
-            hasConflict = true;
-            conflictDiff = content;
-          }
+        if (syncRes.mergeResult === "CONFLICT") {
+          hasConflict = true;
         }
 
         jobFileUpdates.push(
           prisma.syncJobFile.update({
             where: { id: jobFile.id },
-            data: { mergeResult, conflictDiff },
+            data: {
+              mergeResult: syncRes.mergeResult,
+              conflictDiff: syncRes.conflictDiff,
+            },
           })
         );
       }
@@ -774,54 +816,8 @@ class SyncQueue {
       fetchArgs.push(job.pushEvent.commitSha);
       runGit(fetchArgs, targetDir, { stdio: "ignore" });
 
-      // 5. Build patch file for selected files only
-      const patchFile = path.join(tempDir, "selected.patch");
-      const selectedPaths = job.files.map((f: any) => f.filePath);
-
-      // Separate files into: those that already exist in the client (patchable)
-      // and those that are missing from the client (must be placed directly).
-      const safePaths = getSafeSelectedPaths(selectedPaths, targetDir);
-      const missingPaths = selectedPaths.filter((p: string) => !safePaths.includes(p));
-
-      // Directly place missing files at their final commitSha state.
-      // This avoids "does not exist in index" errors from git apply.
-      if (missingPaths.length > 0) {
-        console.log(`[SyncQueue] Apply: Placing ${missingPaths.length} missing file(s) directly from commitSha.`);
-        placeFilesFromCommit(missingPaths, job.pushEvent.commitSha, targetDir);
-      }
-
-      // Build patch only for files that already exist in the client repo.
-      let selectedPatch = "";
-      if (safePaths.length > 0) {
-        selectedPatch = runGit(["diff", "--binary", job.pushEvent.baseSha, job.pushEvent.commitSha, "--", ...safePaths], targetDir);
-      }
-      fs.writeFileSync(patchFile, selectedPatch);
-
-      if (selectedPatch.trim().length === 0) {
-        await prisma.syncJobFile.updateMany({
-          where: { syncJobId: jobId },
-          data: {
-            mergeResult: "CLEAN",
-            conflictDiff: null,
-          },
-        });
-
-        await prisma.syncJob.update({
-          where: { id: jobId },
-          data: {
-            status: "APPLIED",
-            branchName: null,
-            prUrl: null,
-            prNumber: null,
-            errorMessage: "Already up to date",
-          },
-        });
-
-        console.log(`[SyncQueue] Real Apply skipped for SyncJob ${jobId}. Empty patch; already up to date.`);
-        return;
-      }
-
-      // 6. Create sync branch
+      // 5. Create sync branch
+      const baseRef = job.pushEvent.baseSha === "HEAD" ? `${job.pushEvent.commitSha}~1` : job.pushEvent.baseSha;
       const shortSha = job.pushEvent.commitSha.substring(0, 7);
       const branchName = sanitizeBranchPart(`sync/main-${shortSha}-${jobId.substring(0, 8)}`);
       runGit(["checkout", "-b", branchName], targetDir);
@@ -833,31 +829,57 @@ class SyncQueue {
         data: { branchName },
       });
 
-      // 7. Apply patch. If the user saved conflict resolutions, those files
-      // override the patch result before we stage and commit.
-      try {
-        runGit(["apply", "--3way", "--whitespace=nowarn", patchFile], targetDir);
-        this.applySavedResolvedFiles(job, targetDir);
-        runGit(["add", "-A"], targetDir);
-      } catch (applyErr) {
-        const usedSavedResolutions = this.applySavedResolvedFiles(job, targetDir);
-        if (usedSavedResolutions) {
-          const hasRemainingConflict = await this.recordApplyConflicts(job, targetDir);
-          if (!hasRemainingConflict) {
-            runGit(["add", "-A"], targetDir);
-          } else {
-            throw Object.assign(
-              new Error(`Git apply patch failed: ${formatGitError(applyErr)}`),
-              { syncStatus: "CONFLICT" }
-            );
-          }
-        } else {
-          const hasConflict = await this.recordApplyConflicts(job, targetDir);
-          throw Object.assign(
-            new Error(`Git apply patch failed: ${formatGitError(applyErr)}`),
-            { syncStatus: hasConflict ? "CONFLICT" : "FAILED" }
-          );
+      // 6. Perform file-by-file merge and staging
+      let hasConflict = false;
+      const jobFileUpdates = [];
+
+      for (const jobFile of job.files) {
+        const savedResolved =
+          jobFile.mergeResult === "MERGED" &&
+          typeof jobFile.conflictDiff === "string" &&
+          jobFile.conflictDiff.startsWith(RESOLVED_CONTENT_PREFIX)
+            ? jobFile.conflictDiff
+            : null;
+
+        const syncRes = syncSingleFile(
+          jobFile.filePath,
+          baseRef,
+          job.pushEvent.commitSha,
+          targetDir,
+          tempDir,
+          false, // isDryRun = false
+          savedResolved
+        );
+
+        if (syncRes.mergeResult === "CONFLICT") {
+          hasConflict = true;
         }
+
+        jobFileUpdates.push(
+          prisma.syncJobFile.update({
+            where: { id: jobFile.id },
+            data: {
+              mergeResult: syncRes.mergeResult,
+              conflictDiff: syncRes.conflictDiff,
+            },
+          })
+        );
+      }
+
+      // Run database updates in chunks of 200 via transaction
+      if (jobFileUpdates.length > 0) {
+        const chunkSize = 200;
+        for (let i = 0; i < jobFileUpdates.length; i += chunkSize) {
+          const chunk = jobFileUpdates.slice(i, i + chunkSize);
+          await prisma.$transaction(chunk);
+        }
+      }
+
+      if (hasConflict) {
+        throw Object.assign(
+          new Error("Sync job contains merge conflicts. Please resolve conflicts before applying."),
+          { syncStatus: "CONFLICT" }
+        );
       }
 
       let hasStagedChanges = true;
