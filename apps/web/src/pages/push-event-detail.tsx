@@ -25,6 +25,9 @@ import {
   AlertTriangle,
   XCircle,
   Undo2,
+  Search,
+  Eye,
+  EyeOff,
 } from "lucide-react";
 import { api } from "../lib/api-client";
 import { Button } from "../components/ui/button";
@@ -227,6 +230,13 @@ export function PushEventDetailPage() {
   // Filters & performance paging states for Dry-Run results
   const [syncFileFilter, setSyncFileFilter] = useState<"ALL" | "CONFLICT" | "MERGED" | "CLEAN">("ALL");
   const [showAllFilesMap, setShowAllFilesMap] = useState<Record<string, boolean>>({});
+  const [expandedConflictFileIds, setExpandedConflictFileIds] = useState<Record<string, boolean>>({});
+
+  // Performance & Chunking States
+  const [matrixSearch, setMatrixSearch] = useState("");
+  const [matrixPage, setMatrixPage] = useState(1);
+  const MATRIX_PAGE_SIZE = 20;
+  const [diffFileSearch, setDiffFileSearch] = useState("");
 
   // Sync targeting states
   const [selectedRepoIds, setSelectedRepoIds] = useState<string[]>([]);
@@ -732,12 +742,26 @@ export function PushEventDetailPage() {
           {/* Left: Files List */}
           <div className="space-y-2">
             <h2 className="text-xs font-bold text-text-muted uppercase tracking-wider">
-              Modified Files List
+              Modified Files List ({files.length})
             </h2>
-            <div className="space-y-2 max-h-[76vh] overflow-y-auto pr-0.5">
+            <div className="relative">
+              <Search className="w-3.5 h-3.5 absolute left-2.5 top-2.5 text-text-muted" />
+              <input
+                type="text"
+                placeholder="Filter files by path..."
+                value={diffFileSearch}
+                onChange={(e) => setDiffFileSearch(e.target.value)}
+                className="w-full pl-8 pr-3 py-1.5 bg-page border border-border rounded-lg text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent"
+              />
+            </div>
+            <div className="space-y-2 max-h-[72vh] overflow-y-auto pr-0.5">
               {commitFileGroups.length > 0 ? (
                 commitFileGroups.map((group, index) => {
-                  const isOpen = openCommitShas.includes(group.sha);
+                  const filteredGroupFiles = group.files.filter((gf) =>
+                    gf.filePath.toLowerCase().includes(diffFileSearch.toLowerCase())
+                  );
+                  if (diffFileSearch && filteredGroupFiles.length === 0) return null;
+                  const isOpen = openCommitShas.includes(group.sha) || Boolean(diffFileSearch);
                   return (
                     <div key={group.sha} className="border border-border rounded-lg bg-card overflow-hidden">
                       <div className="flex items-start gap-2 p-2.5 hover:bg-card-hover transition-colors">
@@ -762,7 +786,7 @@ export function PushEventDetailPage() {
                               {group.message.split("\n")[0]}
                             </p>
                             <p className="text-[10px] text-text-muted mt-0.5">
-                              {group.files.length} file{group.files.length === 1 ? "" : "s"} affected
+                              {filteredGroupFiles.length} file{filteredGroupFiles.length === 1 ? "" : "s"} affected
                             </p>
                           </div>
                         </button>
@@ -780,7 +804,7 @@ export function PushEventDetailPage() {
 
                       {isOpen && (
                         <div className="space-y-1 p-1.5 border-t border-border bg-page/30">
-                          {group.files.map((groupFile) => {
+                          {filteredGroupFiles.map((groupFile) => {
                             const file = fileByPath.get(groupFile.filePath);
                             if (!file) return null;
                             const isSelected = file.id === selectedFileId;
@@ -810,38 +834,44 @@ export function PushEventDetailPage() {
                   );
                 })
               ) : (
-                Object.keys(groupedFiles).map((folder) => (
-                  <div key={folder} className="space-y-1">
-                    <div className="flex items-center gap-1 text-3xs font-bold text-text-muted uppercase tracking-wider py-1 px-1">
-                      <Folder className="w-3 h-3 text-accent" />
-                      <span>{folder === "/" ? "Root Files" : folder}</span>
+                Object.keys(groupedFiles).map((folder) => {
+                  const filteredFolderFiles = groupedFiles[folder].filter((f) =>
+                    f.filePath.toLowerCase().includes(diffFileSearch.toLowerCase())
+                  );
+                  if (filteredFolderFiles.length === 0) return null;
+                  return (
+                    <div key={folder} className="space-y-1">
+                      <div className="flex items-center gap-1 text-3xs font-bold text-text-muted uppercase tracking-wider py-1 px-1">
+                        <Folder className="w-3 h-3 text-accent" />
+                        <span>{folder === "/" ? "Root Files" : folder}</span>
+                      </div>
+                      <div className="space-y-1 pl-1">
+                        {filteredFolderFiles.map((file) => {
+                          const isSelected = file.id === selectedFileId;
+                          return (
+                            <button
+                              key={file.id}
+                              onClick={() => setSelectedFileId(file.id)}
+                              className={`w-full text-left p-2 rounded-lg border text-xs flex items-center justify-between gap-3 transition-all duration-150 ${
+                                isSelected
+                                  ? "bg-accent/10 border-accent/40 text-text-primary font-medium"
+                                  : "bg-card border-border hover:border-border-light text-text-secondary hover:bg-card-hover"
+                              }`}
+                            >
+                              <span className="truncate block flex-1" title={file.filePath}>
+                                {file.filePath.split("/").slice(1).join("/") || file.filePath}
+                              </span>
+                              <span className="font-mono text-3xs font-semibold flex-shrink-0">
+                                {file.additions > 0 && <span className="text-success">+{file.additions} </span>}
+                                {file.deletions > 0 && <span className="text-danger">-{file.deletions}</span>}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
                     </div>
-                    <div className="space-y-1 pl-1">
-                      {groupedFiles[folder].map((file) => {
-                        const isSelected = file.id === selectedFileId;
-                        return (
-                          <button
-                            key={file.id}
-                            onClick={() => setSelectedFileId(file.id)}
-                            className={`w-full text-left p-2 rounded-lg border text-xs flex items-center justify-between gap-3 transition-all duration-150 ${
-                              isSelected
-                                ? "bg-accent/10 border-accent/40 text-text-primary font-medium"
-                                : "bg-card border-border hover:border-border-light text-text-secondary hover:bg-card-hover"
-                            }`}
-                          >
-                            <span className="truncate block flex-1" title={file.filePath}>
-                              {file.filePath.split("/").slice(1).join("/") || file.filePath}
-                            </span>
-                            <span className="font-mono text-3xs font-semibold flex-shrink-0">
-                              {file.additions > 0 && <span className="text-success">+{file.additions} </span>}
-                              {file.deletions > 0 && <span className="text-danger">-{file.deletions}</span>}
-                            </span>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-                ))
+                  );
+                })
               )}
             </div>
           </div>
@@ -1031,56 +1061,115 @@ export function PushEventDetailPage() {
                 </p>
 
                 {selectedRepoIds.length > 0 ? (
-                  <div className="border border-border rounded-lg overflow-hidden bg-page mt-3 max-h-[300px] overflow-y-auto">
-                    <table className="w-full text-left text-xs border-collapse">
-                      <thead>
-                        <tr className="bg-card border-b border-border text-3xs text-text-muted uppercase font-bold tracking-wider">
-                          <th className="p-3">File Path</th>
-                          {selectedRepoIds.map((repoId) => {
-                            const repo = scopedClientRepos.find((r) => r.id === repoId);
-                            return (
-                              <th key={repoId} className="p-3 text-center min-w-[100px] truncate max-w-[120px]">
-                                <div className="flex flex-col items-center gap-1">
-                                  <span className="text-text-primary text-2xs truncate block w-full text-center">
-                                    {repo?.customerName || repo?.githubName}
-                                  </span>
-                                  <button
-                                    onClick={() => handleToggleAllFilesForRepo(repoId, allFilePaths)}
-                                    className="text-[10px] text-accent hover:underline font-medium normal-case"
-                                  >
-                                    Toggle All
-                                  </button>
-                                </div>
-                              </th>
-                            );
-                          })}
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-border/60">
-                        {files.map((file) => (
-                          <tr key={file.id} className="hover:bg-card-hover/20">
-                            <td className="p-3 font-mono text-3xs text-text-secondary truncate max-w-[200px]" title={file.filePath}>
-                              {file.filePath}
-                            </td>
-                            {selectedRepoIds.map((repoId) => {
-                              const repoSelectedFiles = fileSelection[repoId] || [];
-                              const isChecked = repoSelectedFiles.includes(file.filePath);
-                              return (
-                                <td key={repoId} className="p-3 text-center">
-                                  <input
-                                    type="checkbox"
-                                    checked={isChecked}
-                                    onChange={() => handleFileToggle(repoId, file.filePath)}
-                                    className="w-4 h-4 rounded border-border text-accent focus:ring-accent bg-page cursor-pointer"
-                                  />
-                                </td>
-                              );
-                            })}
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
+                  (() => {
+                    const filteredMatrixFiles = files.filter((f) =>
+                      f.filePath.toLowerCase().includes(matrixSearch.toLowerCase())
+                    );
+                    const totalMatrixPages = Math.ceil(filteredMatrixFiles.length / MATRIX_PAGE_SIZE) || 1;
+                    const currentMatrixPageFiles = filteredMatrixFiles.slice(
+                      (matrixPage - 1) * MATRIX_PAGE_SIZE,
+                      matrixPage * MATRIX_PAGE_SIZE
+                    );
+
+                    return (
+                      <div className="space-y-2 mt-3">
+                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                          <div className="relative flex-1">
+                            <Search className="w-3.5 h-3.5 absolute left-2.5 top-2.5 text-text-muted" />
+                            <input
+                              type="text"
+                              placeholder="Search matrix files by path..."
+                              value={matrixSearch}
+                              onChange={(e) => {
+                                setMatrixSearch(e.target.value);
+                                setMatrixPage(1);
+                              }}
+                              className="w-full pl-8 pr-3 py-1 bg-page border border-border rounded-lg text-xs text-text-primary placeholder:text-text-muted focus:outline-none focus:border-accent"
+                            />
+                          </div>
+                          <div className="text-3xs text-text-muted">
+                            Showing {filteredMatrixFiles.length > 0 ? (matrixPage - 1) * MATRIX_PAGE_SIZE + 1 : 0}-
+                            {Math.min(matrixPage * MATRIX_PAGE_SIZE, filteredMatrixFiles.length)} of {filteredMatrixFiles.length} files
+                          </div>
+                        </div>
+
+                        <div className="border border-border rounded-lg overflow-hidden bg-page max-h-[300px] overflow-y-auto">
+                          <table className="w-full text-left text-xs border-collapse">
+                            <thead>
+                              <tr className="bg-card border-b border-border text-3xs text-text-muted uppercase font-bold tracking-wider">
+                                <th className="p-3">File Path</th>
+                                {selectedRepoIds.map((repoId) => {
+                                  const repo = scopedClientRepos.find((r) => r.id === repoId);
+                                  return (
+                                    <th key={repoId} className="p-3 text-center min-w-[100px] truncate max-w-[120px]">
+                                      <div className="flex flex-col items-center gap-1">
+                                        <span className="text-text-primary text-2xs truncate block w-full text-center">
+                                          {repo?.customerName || repo?.githubName}
+                                        </span>
+                                        <button
+                                          onClick={() => handleToggleAllFilesForRepo(repoId, allFilePaths)}
+                                          className="text-[10px] text-accent hover:underline font-medium normal-case"
+                                        >
+                                          Toggle All
+                                        </button>
+                                      </div>
+                                    </th>
+                                  );
+                                })}
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-border/60">
+                              {currentMatrixPageFiles.map((file) => (
+                                <tr key={file.id} className="hover:bg-card-hover/20">
+                                  <td className="p-3 font-mono text-3xs text-text-secondary truncate max-w-[200px]" title={file.filePath}>
+                                    {file.filePath}
+                                  </td>
+                                  {selectedRepoIds.map((repoId) => {
+                                    const repoSelectedFiles = fileSelection[repoId] || [];
+                                    const isChecked = repoSelectedFiles.includes(file.filePath);
+                                    return (
+                                      <td key={repoId} className="p-3 text-center">
+                                        <input
+                                          type="checkbox"
+                                          checked={isChecked}
+                                          onChange={() => handleFileToggle(repoId, file.filePath)}
+                                          className="w-4 h-4 rounded border-border text-accent focus:ring-accent bg-page cursor-pointer"
+                                        />
+                                      </td>
+                                    );
+                                  })}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+
+                        {totalMatrixPages > 1 && (
+                          <div className="flex items-center justify-between pt-1 text-3xs text-text-muted">
+                            <span>Page {matrixPage} of {totalMatrixPages}</span>
+                            <div className="flex items-center gap-1.5">
+                              <Button
+                                variant="secondary"
+                                className="h-6 px-2 text-3xs"
+                                disabled={matrixPage <= 1}
+                                onClick={() => setMatrixPage((p) => p - 1)}
+                              >
+                                Prev
+                              </Button>
+                              <Button
+                                variant="secondary"
+                                className="h-6 px-2 text-3xs"
+                                disabled={matrixPage >= totalMatrixPages}
+                                onClick={() => setMatrixPage((p) => p + 1)}
+                              >
+                                Next
+                              </Button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()
                 ) : (
                   <div className="p-6 bg-page/50 border border-dashed border-border rounded-lg text-center text-text-muted text-xs leading-relaxed">
                     No target repositories selected. <br />
@@ -1391,42 +1480,112 @@ export function PushEventDetailPage() {
                         );
                       })()}
 
-                        {/* Conflict Diff Box */}
-                        {job.files?.map((file) => {
-                          if (file.mergeResult === "CONFLICT" && file.conflictDiff) {
-                            const targetLabel = `${job.targetRepo?.fullName || "target"}:${job.targetRepo?.branch || "branch"}`;
-                            const sourceLabel = `${event?.repository?.fullName || "main"}:${event?.branch || "branch"}`;
-                            return (
-                              <div
-                                key={file.id}
-                                className="border border-warning/30 rounded-lg overflow-hidden"
-                              >
-                                <div className="px-3.5 py-2 bg-warning/10 border-b border-warning/20 text-warning text-xs font-semibold flex items-center gap-1.5">
-                                  <AlertTriangle className="w-4 h-4" />
-                                  <span>Conflict in {file.filePath}</span>
-                                </div>
-                                <div className="px-2.5 py-1.5 bg-page/80 border-b border-border flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px]">
-                                  <span className="flex items-center gap-1">
-                                    <span className="w-2.5 h-2.5 rounded-sm bg-red-500/40 border border-red-500/60 inline-block" />
-                                    <span className="text-red-400 font-semibold">{targetLabel}</span>
-                                    <span className="text-text-muted">(target branch)</span>
-                                  </span>
-                                  <span className="flex items-center gap-1">
-                                    <span className="w-2.5 h-2.5 rounded-sm bg-blue-500/40 border border-blue-500/60 inline-block" />
-                                    <span className="text-blue-400 font-semibold">{sourceLabel}</span>
-                                    <span className="text-text-muted">(source branch)</span>
-                                  </span>
-                                </div>
-                                <div className="p-3 bg-page overflow-x-auto max-h-[320px] overflow-y-auto">
-                                  <pre className="font-mono text-3xs leading-relaxed select-text space-y-0">
-                                    {renderConflictDiff(file.conflictDiff, targetLabel, sourceLabel)}
-                                  </pre>
-                                </div>
+                        {/* Conflict Diff Box - Accordion / On-Demand Preview */}
+                        {(() => {
+                          const conflictFiles = (job.files || []).filter(
+                            (file) => file.mergeResult === "CONFLICT" && file.conflictDiff
+                          );
+                          if (conflictFiles.length === 0) return null;
+
+                          const allExpanded = conflictFiles.every((f) => expandedConflictFileIds[f.id]);
+
+                          return (
+                            <div className="space-y-2 pt-3 border-t border-warning/20">
+                              <div className="flex items-center justify-between">
+                                <h4 className="text-2xs font-bold text-warning uppercase tracking-wider flex items-center gap-1.5">
+                                  <AlertTriangle className="w-3.5 h-3.5" />
+                                  Conflict Diff Previews ({conflictFiles.length} file{conflictFiles.length === 1 ? "" : "s"})
+                                </h4>
+                                <Button
+                                  type="button"
+                                  variant="secondary"
+                                  onClick={() => {
+                                    const nextState = !allExpanded;
+                                    const updated: Record<string, boolean> = { ...expandedConflictFileIds };
+                                    conflictFiles.forEach((f) => {
+                                      updated[f.id] = nextState;
+                                    });
+                                    setExpandedConflictFileIds(updated);
+                                  }}
+                                  className="h-6 px-2 text-[10px] text-warning border-warning/30 hover:bg-warning/10"
+                                >
+                                  {allExpanded ? "Collapse All Diffs" : "Expand All Diffs"}
+                                </Button>
                               </div>
-                            );
-                          }
-                          return null;
-                        })}
+
+                              {conflictFiles.map((file) => {
+                                const isExpanded = Boolean(expandedConflictFileIds[file.id]);
+                                const targetLabel = `${job.targetRepo?.fullName || "target"}:${job.targetRepo?.branch || "branch"}`;
+                                const sourceLabel = `${event?.repository?.fullName || "main"}:${event?.branch || "branch"}`;
+
+                                return (
+                                  <div
+                                    key={file.id}
+                                    className="border border-warning/30 rounded-lg overflow-hidden bg-page/40"
+                                  >
+                                    <div className="px-3.5 py-2 bg-warning/10 border-b border-warning/20 text-warning text-xs font-semibold flex items-center justify-between gap-2">
+                                      <div className="flex items-center gap-1.5 truncate">
+                                        <AlertTriangle className="w-4 h-4 flex-shrink-0" />
+                                        <span className="truncate">Conflict in {file.filePath}</span>
+                                      </div>
+                                      <div className="flex items-center gap-2 flex-shrink-0">
+                                        <button
+                                          type="button"
+                                          onClick={() => openResolutionEditor(job, file.filePath, file.conflictDiff)}
+                                          className="text-3xs bg-success/20 hover:bg-success/30 text-success border border-success/30 px-2 py-0.5 rounded font-semibold transition-colors"
+                                        >
+                                          Resolve conflict
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() =>
+                                            setExpandedConflictFileIds((prev) => ({
+                                              ...prev,
+                                              [file.id]: !isExpanded,
+                                            }))
+                                          }
+                                          className="text-3xs bg-card hover:bg-card-hover text-text-primary border border-border px-2 py-0.5 rounded font-medium flex items-center gap-1 transition-colors"
+                                        >
+                                          {isExpanded ? (
+                                            <>
+                                              <EyeOff className="w-3 h-3" /> Hide Diff
+                                            </>
+                                          ) : (
+                                            <>
+                                              <Eye className="w-3 h-3 text-accent" /> Preview Diff
+                                            </>
+                                          )}
+                                        </button>
+                                      </div>
+                                    </div>
+
+                                    {isExpanded && (
+                                      <>
+                                        <div className="px-2.5 py-1.5 bg-page/80 border-b border-border flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px]">
+                                          <span className="flex items-center gap-1">
+                                            <span className="w-2.5 h-2.5 rounded-sm bg-red-500/40 border border-red-500/60 inline-block" />
+                                            <span className="text-red-400 font-semibold">{targetLabel}</span>
+                                            <span className="text-text-muted">(target branch)</span>
+                                          </span>
+                                          <span className="flex items-center gap-1">
+                                            <span className="w-2.5 h-2.5 rounded-sm bg-blue-500/40 border border-blue-500/60 inline-block" />
+                                            <span className="text-blue-400 font-semibold">{sourceLabel}</span>
+                                            <span className="text-text-muted">(source branch)</span>
+                                          </span>
+                                        </div>
+                                        <div className="p-3 bg-page overflow-x-auto max-h-[320px] overflow-y-auto">
+                                          <pre className="font-mono text-3xs leading-relaxed select-text space-y-0">
+                                            {renderConflictDiff(file.conflictDiff || "", targetLabel, sourceLabel)}
+                                          </pre>
+                                        </div>
+                                      </>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          );
+                        })()}
                     </div>
                   </div>
                 ))}

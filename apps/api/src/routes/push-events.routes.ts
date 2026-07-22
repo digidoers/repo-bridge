@@ -164,12 +164,26 @@ pushEventsRouter.get("/:id", async (req: Request, res: Response, next: NextFunct
         if (headIndex >= 0) {
           const rangeSummaries = branchCommits.slice(headIndex);
 
-          for (const summary of rangeSummaries) {
-            const commit = await GithubAppService.getCommit(
-              pushEvent.repository.installationId,
-              pushEvent.repository.fullName,
-              summary.sha
-            );
+          // Fetch commit details in parallel to optimize initial load time
+          const commitDetails = await Promise.all(
+            rangeSummaries.map(async (summary) => {
+              try {
+                const commit = await GithubAppService.getCommit(
+                  pushEvent.repository.installationId,
+                  pushEvent.repository.fullName,
+                  summary.sha
+                );
+                return { summary, commit };
+              } catch (err) {
+                console.warn(`[PushEvents] Failed to fetch commit ${summary.sha}:`, err);
+                return null;
+              }
+            })
+          );
+
+          for (const item of commitDetails) {
+            if (!item) continue;
+            const { commit } = item;
             const files = commit.files
               .filter((file) => selectedFilePaths.has(file.filename))
               .map((file) => ({
