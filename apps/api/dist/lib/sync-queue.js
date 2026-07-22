@@ -358,35 +358,45 @@ class SyncQueue {
                         const stats = statsMap.get(filePath) || { additions: 0, deletions: 0 };
                         const filePatch = patchesMap.get(filePath) || null;
                         const existingId = existingPushFilesMap.get(filePath);
-                        if (existingId) {
-                            pushFileOperations.push(prisma.pushFile.update({
-                                where: { id: existingId },
-                                data: {
-                                    patch: sanitizePgText(filePatch),
-                                    additions: stats.additions,
-                                    deletions: stats.deletions,
-                                }
-                            }));
-                        }
-                        else {
-                            pushFileOperations.push(prisma.pushFile.create({
-                                data: {
-                                    pushEventId: job.pushEventId,
-                                    filePath,
-                                    changeType: "modified",
-                                    patch: sanitizePgText(filePatch),
-                                    additions: stats.additions,
-                                    deletions: stats.deletions,
-                                }
-                            }));
-                        }
+                        pushFileOperations.push({
+                            existingId,
+                            filePath,
+                            filePatch,
+                            additions: stats.additions,
+                            deletions: stats.deletions,
+                        });
                     }
-                    // Run push files operations in chunks of 200 via transaction
+                    // Run push files operations in chunks of 100 via single-connection transaction
                     if (pushFileOperations.length > 0) {
-                        const chunkSize = 200;
+                        const chunkSize = 100;
                         for (let i = 0; i < pushFileOperations.length; i += chunkSize) {
                             const chunk = pushFileOperations.slice(i, i + chunkSize);
-                            await prisma.$transaction(chunk);
+                            await prisma.$transaction(async (tx) => {
+                                for (const item of chunk) {
+                                    if (item.existingId) {
+                                        await tx.pushFile.update({
+                                            where: { id: item.existingId },
+                                            data: {
+                                                patch: sanitizePgText(item.filePatch),
+                                                additions: item.additions,
+                                                deletions: item.deletions,
+                                            },
+                                        });
+                                    }
+                                    else {
+                                        await tx.pushFile.create({
+                                            data: {
+                                                pushEventId: job.pushEventId,
+                                                filePath: item.filePath,
+                                                changeType: "modified",
+                                                patch: sanitizePgText(item.filePatch),
+                                                additions: item.additions,
+                                                deletions: item.deletions,
+                                            },
+                                        });
+                                    }
+                                }
+                            });
                         }
                     }
                 }
@@ -409,7 +419,7 @@ class SyncQueue {
             runGit(["checkout", "-b", `dry-run-${jobId}`], targetDir);
             const baseRef = job.pushEvent.baseSha === "HEAD" ? `${job.pushEvent.commitSha}~1` : job.pushEvent.baseSha;
             let hasConflict = false;
-            const jobFileUpdates = [];
+            const fileUpdateItems = [];
             for (const jobFile of job.files) {
                 // Preserve user-saved resolutions across dry-run passes
                 if (jobFile.conflictDiff && jobFile.conflictDiff.startsWith(RESOLVED_CONTENT_PREFIX)) {
@@ -420,20 +430,28 @@ class SyncQueue {
                 if (syncRes.mergeResult === "CONFLICT") {
                     hasConflict = true;
                 }
-                jobFileUpdates.push(prisma.syncJobFile.update({
-                    where: { id: jobFile.id },
-                    data: {
-                        mergeResult: syncRes.mergeResult,
-                        conflictDiff: sanitizePgText(syncRes.conflictDiff),
-                    },
-                }));
+                fileUpdateItems.push({
+                    id: jobFile.id,
+                    mergeResult: syncRes.mergeResult,
+                    conflictDiff: sanitizePgText(syncRes.conflictDiff),
+                });
             }
-            // Run database updates in chunks of 200 via transaction
-            if (jobFileUpdates.length > 0) {
-                const chunkSize = 200;
-                for (let i = 0; i < jobFileUpdates.length; i += chunkSize) {
-                    const chunk = jobFileUpdates.slice(i, i + chunkSize);
-                    await prisma.$transaction(chunk);
+            // Run database updates in chunks of 100 via single-connection transaction
+            if (fileUpdateItems.length > 0) {
+                const chunkSize = 100;
+                for (let i = 0; i < fileUpdateItems.length; i += chunkSize) {
+                    const chunk = fileUpdateItems.slice(i, i + chunkSize);
+                    await prisma.$transaction(async (tx) => {
+                        for (const item of chunk) {
+                            await tx.syncJobFile.update({
+                                where: { id: item.id },
+                                data: {
+                                    mergeResult: item.mergeResult,
+                                    conflictDiff: item.conflictDiff,
+                                },
+                            });
+                        }
+                    });
                 }
             }
             if (options.autoResolveStrategy) {
@@ -547,21 +565,24 @@ class SyncQueue {
             if (!job) {
                 throw new Error("Sync job not found");
             }
-            const updates = resolutions.map((res) => prisma.syncJobFile.updateMany({
-                where: {
-                    syncJobId,
-                    filePath: res.filePath,
-                },
-                data: {
-                    mergeResult: "MERGED",
-                    conflictDiff: `${RESOLVED_CONTENT_PREFIX}${res.resolvedContent}`,
-                },
-            }));
-            if (updates.length > 0) {
-                const chunkSize = 200;
-                for (let i = 0; i < updates.length; i += chunkSize) {
-                    const chunk = updates.slice(i, i + chunkSize);
-                    await prisma.$transaction(chunk);
+            if (resolutions.length > 0) {
+                const chunkSize = 100;
+                for (let i = 0; i < resolutions.length; i += chunkSize) {
+                    const chunk = resolutions.slice(i, i + chunkSize);
+                    await prisma.$transaction(async (tx) => {
+                        for (const res of chunk) {
+                            await tx.syncJobFile.updateMany({
+                                where: {
+                                    syncJobId,
+                                    filePath: res.filePath,
+                                },
+                                data: {
+                                    mergeResult: "MERGED",
+                                    conflictDiff: `${RESOLVED_CONTENT_PREFIX}${res.resolvedContent}`,
+                                },
+                            });
+                        }
+                    });
                 }
             }
             const remainingConflicts = await prisma.syncJobFile.count({

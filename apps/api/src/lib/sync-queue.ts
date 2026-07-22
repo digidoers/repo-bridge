@@ -106,7 +106,7 @@ function syncSingleFile(
       if (!isDryRun) {
         try {
           runGit(["rm", "-f", safePath], targetDir);
-        } catch {}
+        } catch { }
       }
     }
     return { mergeResult: "CLEAN", conflictDiff: null };
@@ -165,8 +165,8 @@ function syncSingleFile(
       return { mergeResult: "CONFLICT", conflictDiff: conflictContent };
     }
   } finally {
-    try { fs.rmSync(baseTmp, { force: true }); } catch {}
-    try { fs.rmSync(commitTmp, { force: true }); } catch {}
+    try { fs.rmSync(baseTmp, { force: true }); } catch { }
+    try { fs.rmSync(commitTmp, { force: true }); } catch { }
   }
 }
 
@@ -191,7 +191,7 @@ function parseUnifiedDiff(diffOutput: string): Map<string, string> {
       filePath = quotedMatch[1];
       try {
         filePath = JSON.parse(`"${filePath}"`);
-      } catch (e) {}
+      } catch (e) { }
     } else {
       const unquotedMatch = headerLine.match(/^a\/(.+?) b\/.+$/);
       if (unquotedMatch) {
@@ -334,7 +334,7 @@ class SyncQueue {
 
     const jobId = job.id;
     const tempDir = path.join(process.cwd(), "temp-jobs", jobId);
-    
+
     try {
       // 1. Create temp directory
       fs.mkdirSync(tempDir, { recursive: true });
@@ -354,7 +354,7 @@ class SyncQueue {
       // 4. Add upstream remote and fetch commits
       const mainUrl = `https://x-access-token:${mainToken}@github.com/${mainRepo.fullName}.git`;
       runGit(["remote", "add", "upstream", mainUrl], targetDir);
-      
+
       const fetchArgs = ["fetch", "upstream"];
       if (job.pushEvent.baseSha !== "HEAD") {
         fetchArgs.push(job.pushEvent.baseSha);
@@ -411,45 +411,57 @@ class SyncQueue {
           });
           const existingPushFilesMap = new Map(existingPushFiles.map(pf => [pf.filePath, pf.id]));
 
-          const pushFileOperations = [];
+          const pushFileOperations: Array<{
+            existingId?: string;
+            filePath: string;
+            filePatch: string | null;
+            additions: number;
+            deletions: number;
+          }> = [];
+
           for (const filePath of selectedPaths) {
             const stats = statsMap.get(filePath) || { additions: 0, deletions: 0 };
             const filePatch = patchesMap.get(filePath) || null;
             const existingId = existingPushFilesMap.get(filePath);
-
-            if (existingId) {
-              pushFileOperations.push(
-                prisma.pushFile.update({
-                  where: { id: existingId },
-                  data: {
-                    patch: sanitizePgText(filePatch),
-                    additions: stats.additions,
-                    deletions: stats.deletions,
-                  }
-                })
-              );
-            } else {
-              pushFileOperations.push(
-                prisma.pushFile.create({
-                  data: {
-                    pushEventId: job.pushEventId,
-                    filePath,
-                    changeType: "modified",
-                    patch: sanitizePgText(filePatch),
-                    additions: stats.additions,
-                    deletions: stats.deletions,
-                  }
-                })
-              );
-            }
+            pushFileOperations.push({
+              existingId,
+              filePath,
+              filePatch,
+              additions: stats.additions,
+              deletions: stats.deletions,
+            });
           }
 
-          // Run push files operations in chunks of 200 via transaction
+          // Run push files operations in chunks of 100 via single-connection transaction
           if (pushFileOperations.length > 0) {
-            const chunkSize = 200;
+            const chunkSize = 100;
             for (let i = 0; i < pushFileOperations.length; i += chunkSize) {
               const chunk = pushFileOperations.slice(i, i + chunkSize);
-              await prisma.$transaction(chunk);
+              await prisma.$transaction(async (tx) => {
+                for (const item of chunk) {
+                  if (item.existingId) {
+                    await tx.pushFile.update({
+                      where: { id: item.existingId },
+                      data: {
+                        patch: sanitizePgText(item.filePatch),
+                        additions: item.additions,
+                        deletions: item.deletions,
+                      },
+                    });
+                  } else {
+                    await tx.pushFile.create({
+                      data: {
+                        pushEventId: job.pushEventId,
+                        filePath: item.filePath,
+                        changeType: "modified",
+                        patch: sanitizePgText(item.filePatch),
+                        additions: item.additions,
+                        deletions: item.deletions,
+                      },
+                    });
+                  }
+                }
+              });
             }
           }
         }
@@ -475,7 +487,11 @@ class SyncQueue {
 
       const baseRef = job.pushEvent.baseSha === "HEAD" ? `${job.pushEvent.commitSha}~1` : job.pushEvent.baseSha;
       let hasConflict = false;
-      const jobFileUpdates = [];
+      const fileUpdateItems: Array<{
+        id: string;
+        mergeResult: "CLEAN" | "MERGED" | "CONFLICT";
+        conflictDiff: string | null;
+      }> = [];
 
       for (const jobFile of job.files) {
         // Preserve user-saved resolutions across dry-run passes
@@ -496,23 +512,29 @@ class SyncQueue {
           hasConflict = true;
         }
 
-        jobFileUpdates.push(
-          prisma.syncJobFile.update({
-            where: { id: jobFile.id },
-            data: {
-              mergeResult: syncRes.mergeResult,
-              conflictDiff: sanitizePgText(syncRes.conflictDiff),
-            },
-          })
-        );
+        fileUpdateItems.push({
+          id: jobFile.id,
+          mergeResult: syncRes.mergeResult,
+          conflictDiff: sanitizePgText(syncRes.conflictDiff),
+        });
       }
 
-      // Run database updates in chunks of 200 via transaction
-      if (jobFileUpdates.length > 0) {
-        const chunkSize = 200;
-        for (let i = 0; i < jobFileUpdates.length; i += chunkSize) {
-          const chunk = jobFileUpdates.slice(i, i + chunkSize);
-          await prisma.$transaction(chunk);
+      // Run database updates in chunks of 100 via single-connection transaction
+      if (fileUpdateItems.length > 0) {
+        const chunkSize = 100;
+        for (let i = 0; i < fileUpdateItems.length; i += chunkSize) {
+          const chunk = fileUpdateItems.slice(i, i + chunkSize);
+          await prisma.$transaction(async (tx) => {
+            for (const item of chunk) {
+              await tx.syncJobFile.update({
+                where: { id: item.id },
+                data: {
+                  mergeResult: item.mergeResult,
+                  conflictDiff: item.conflictDiff,
+                },
+              });
+            }
+          });
         }
       }
 
@@ -562,7 +584,7 @@ class SyncQueue {
       // Clean up temp directory
       try {
         fs.rmSync(tempDir, { recursive: true, force: true });
-      } catch (e) {}
+      } catch (e) { }
     }
   }
 
@@ -649,24 +671,24 @@ class SyncQueue {
         throw new Error("Sync job not found");
       }
 
-      const updates = resolutions.map((res) =>
-        prisma.syncJobFile.updateMany({
-          where: {
-            syncJobId,
-            filePath: res.filePath,
-          },
-          data: {
-            mergeResult: "MERGED",
-            conflictDiff: `${RESOLVED_CONTENT_PREFIX}${res.resolvedContent}`,
-          },
-        })
-      );
-
-      if (updates.length > 0) {
-        const chunkSize = 200;
-        for (let i = 0; i < updates.length; i += chunkSize) {
-          const chunk = updates.slice(i, i + chunkSize);
-          await prisma.$transaction(chunk);
+      if (resolutions.length > 0) {
+        const chunkSize = 100;
+        for (let i = 0; i < resolutions.length; i += chunkSize) {
+          const chunk = resolutions.slice(i, i + chunkSize);
+          await prisma.$transaction(async (tx) => {
+            for (const res of chunk) {
+              await tx.syncJobFile.updateMany({
+                where: {
+                  syncJobId,
+                  filePath: res.filePath,
+                },
+                data: {
+                  mergeResult: "MERGED",
+                  conflictDiff: `${RESOLVED_CONTENT_PREFIX}${res.resolvedContent}`,
+                },
+              });
+            }
+          });
         }
       }
 
@@ -753,7 +775,7 @@ class SyncQueue {
       } finally {
         try {
           fs.rmSync(tempDir, { recursive: true, force: true });
-        } catch (e) {}
+        } catch (e) { }
       }
 
       const remainingConflicts = await prisma.syncJobFile.count({
@@ -834,7 +856,7 @@ class SyncQueue {
       });
     } finally {
       this.activeJobs.delete(syncJobId);
-      
+
       // Rollup PushEvent completion check
       try {
         const job = await prisma.syncJob.findUnique({
@@ -1025,7 +1047,7 @@ class SyncQueue {
 
     const jobId = job.id;
     const tempDir = path.join(process.cwd(), "temp-jobs", `apply-${jobId}`);
-    
+
     try {
       // 1. Create fresh temp directory
       fs.mkdirSync(tempDir, { recursive: true });
@@ -1045,7 +1067,7 @@ class SyncQueue {
       // 4. Add upstream remote and fetch commits
       const mainUrl = `https://x-access-token:${mainToken}@github.com/${mainRepo.fullName}.git`;
       runGit(["remote", "add", "upstream", mainUrl], targetDir);
-      
+
       const fetchArgs = ["fetch", "upstream"];
       if (job.pushEvent.baseSha !== "HEAD") {
         fetchArgs.push(job.pushEvent.baseSha);
@@ -1073,8 +1095,8 @@ class SyncQueue {
       for (const jobFile of job.files) {
         const savedResolved =
           jobFile.mergeResult === "MERGED" &&
-          typeof jobFile.conflictDiff === "string" &&
-          jobFile.conflictDiff.startsWith(RESOLVED_CONTENT_PREFIX)
+            typeof jobFile.conflictDiff === "string" &&
+            jobFile.conflictDiff.startsWith(RESOLVED_CONTENT_PREFIX)
             ? jobFile.conflictDiff
             : null;
 
