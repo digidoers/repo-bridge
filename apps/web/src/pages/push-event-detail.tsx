@@ -1320,52 +1320,54 @@ export function PushEventDetailPage() {
                               </div>
                             </div>
 
-                            <div className="max-w-full overflow-x-auto overscroll-x-contain pb-2 rounded-lg border border-border/60 bg-page/20">
+                            <div className="max-w-full overflow-hidden rounded-lg border border-border/60 bg-page/20">
                               {displayedFiles.length > 0 ? (
-                                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2 min-w-full md:min-w-[720px] lg:min-w-[980px] p-2">
-                                  {displayedFiles.map((file) => {
-                                    const isConflict = file.mergeResult === "CONFLICT";
-                                    return (
-                                      <div
-                                        key={file.id}
-                                        className={`p-2.5 rounded-lg border text-xs flex flex-col justify-between gap-2 ${
-                                          isConflict
-                                            ? "bg-warning/5 border-warning/30 text-warning"
-                                            : file.mergeResult === "CLEAN"
-                                            ? "bg-success/5 border-success/20 text-success"
-                                            : file.mergeResult === "MERGED"
-                                            ? "bg-accent/5 border-accent/20 text-accent"
-                                            : "bg-page/50 border-border text-text-secondary"
-                                        }`}
-                                      >
-                                        <div className="flex items-start justify-between gap-2 min-w-0">
-                                          <span className="truncate block font-mono text-3xs" title={file.filePath}>
-                                            {file.filePath}
-                                          </span>
-                                          <span className="text-[10px] font-bold uppercase whitespace-nowrap">
-                                            {getFileMergeResultLabel(file)}
-                                          </span>
-                                        </div>
-
-                                        {isConflict && (
-                                          <div className="flex flex-wrap items-center gap-2 mt-1">
-                                            <button
-                                              onClick={() => openResolutionEditor(job, file.filePath, file.conflictDiff)}
-                                              className="text-[10px] font-semibold text-success hover:underline flex items-center gap-0.5 self-start"
-                                            >
-                                              Resolve conflict
-                                            </button>
-                                            <button
-                                              onClick={() => handleExcludeAndRetry(job, file.filePath)}
-                                              className="text-[10px] font-semibold text-accent hover:underline flex items-center gap-0.5 self-start"
-                                            >
-                                              Exclude file & retry
-                                            </button>
+                                <div className="max-h-[280px] overflow-y-auto overflow-x-hidden p-2">
+                                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-2">
+                                    {displayedFiles.map((file) => {
+                                      const isConflict = file.mergeResult === "CONFLICT";
+                                      return (
+                                        <div
+                                          key={file.id}
+                                          className={`p-2.5 rounded-lg border text-xs flex flex-col justify-between gap-1.5 transition-all ${
+                                            isConflict
+                                              ? "bg-warning/5 border-warning/30 text-warning"
+                                              : file.mergeResult === "CLEAN"
+                                              ? "bg-success/5 border-success/20 text-success"
+                                              : file.mergeResult === "MERGED"
+                                              ? "bg-accent/5 border-accent/20 text-accent"
+                                              : "bg-page/50 border-border text-text-secondary"
+                                          }`}
+                                        >
+                                          <div className="flex items-start justify-between gap-1.5 min-w-0">
+                                            <span className="truncate block font-mono text-3xs font-medium" title={file.filePath}>
+                                              {file.filePath}
+                                            </span>
+                                            <span className="text-[10px] font-bold uppercase whitespace-nowrap flex-shrink-0">
+                                              {getFileMergeResultLabel(file)}
+                                            </span>
                                           </div>
-                                        )}
-                                      </div>
-                                    );
-                                  })}
+
+                                          {isConflict && (
+                                            <div className="flex flex-wrap items-center gap-2 mt-0.5 pt-1 border-t border-warning/20">
+                                              <button
+                                                onClick={() => openResolutionEditor(job, file.filePath, file.conflictDiff)}
+                                                className="text-[10px] font-semibold text-success hover:underline flex items-center gap-0.5"
+                                              >
+                                                Resolve conflict
+                                              </button>
+                                              <button
+                                                onClick={() => handleExcludeAndRetry(job, file.filePath)}
+                                                className="text-[10px] font-semibold text-accent hover:underline flex items-center gap-0.5"
+                                              >
+                                                Exclude & retry
+                                              </button>
+                                            </div>
+                                          )}
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
                                 </div>
                               ) : (
                                 <div className="p-6 text-center text-text-muted text-xs italic">
@@ -1415,7 +1417,7 @@ export function PushEventDetailPage() {
                                     <span className="text-text-muted">(source branch)</span>
                                   </span>
                                 </div>
-                                <div className="p-3 bg-page overflow-x-auto">
+                                <div className="p-3 bg-page overflow-x-auto max-h-[320px] overflow-y-auto">
                                   <pre className="font-mono text-3xs leading-relaxed select-text space-y-0">
                                     {renderConflictDiff(file.conflictDiff, targetLabel, sourceLabel)}
                                   </pre>
