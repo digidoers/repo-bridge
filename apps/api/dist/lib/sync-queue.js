@@ -366,9 +366,9 @@ class SyncQueue {
                             deletions: stats.deletions,
                         });
                     }
-                    // Run push files operations in chunks of 100 via single-connection transaction
+                    // Run push files operations in chunks of 50 via single-connection transaction with 60s timeout
                     if (pushFileOperations.length > 0) {
-                        const chunkSize = 100;
+                        const chunkSize = 50;
                         for (let i = 0; i < pushFileOperations.length; i += chunkSize) {
                             const chunk = pushFileOperations.slice(i, i + chunkSize);
                             await prisma.$transaction(async (tx) => {
@@ -396,7 +396,7 @@ class SyncQueue {
                                         });
                                     }
                                 }
-                            });
+                            }, { maxWait: 10000, timeout: 60000 });
                         }
                     }
                 }
@@ -436,9 +436,9 @@ class SyncQueue {
                     conflictDiff: sanitizePgText(syncRes.conflictDiff),
                 });
             }
-            // Run database updates in chunks of 100 via single-connection transaction
+            // Run database updates in chunks of 50 via single-connection transaction with 60s timeout
             if (fileUpdateItems.length > 0) {
-                const chunkSize = 100;
+                const chunkSize = 50;
                 for (let i = 0; i < fileUpdateItems.length; i += chunkSize) {
                     const chunk = fileUpdateItems.slice(i, i + chunkSize);
                     await prisma.$transaction(async (tx) => {
@@ -451,7 +451,7 @@ class SyncQueue {
                                 },
                             });
                         }
-                    });
+                    }, { maxWait: 10000, timeout: 60000 });
                 }
             }
             if (options.autoResolveStrategy) {
@@ -566,7 +566,7 @@ class SyncQueue {
                 throw new Error("Sync job not found");
             }
             if (resolutions.length > 0) {
-                const chunkSize = 100;
+                const chunkSize = 50;
                 for (let i = 0; i < resolutions.length; i += chunkSize) {
                     const chunk = resolutions.slice(i, i + chunkSize);
                     await prisma.$transaction(async (tx) => {
@@ -582,7 +582,7 @@ class SyncQueue {
                                 },
                             });
                         }
-                    });
+                    }, { maxWait: 10000, timeout: 60000 });
                 }
             }
             const remainingConflicts = await prisma.syncJobFile.count({
@@ -927,7 +927,7 @@ class SyncQueue {
             });
             // 6. Perform file-by-file merge and staging
             let hasConflict = false;
-            const jobFileUpdates = [];
+            const applyUpdateItems = [];
             for (const jobFile of job.files) {
                 const savedResolved = jobFile.mergeResult === "MERGED" &&
                     typeof jobFile.conflictDiff === "string" &&
@@ -939,20 +939,28 @@ class SyncQueue {
                 if (syncRes.mergeResult === "CONFLICT") {
                     hasConflict = true;
                 }
-                jobFileUpdates.push(prisma.syncJobFile.update({
-                    where: { id: jobFile.id },
-                    data: {
-                        mergeResult: syncRes.mergeResult,
-                        conflictDiff: sanitizePgText(syncRes.conflictDiff),
-                    },
-                }));
+                applyUpdateItems.push({
+                    id: jobFile.id,
+                    mergeResult: syncRes.mergeResult,
+                    conflictDiff: sanitizePgText(syncRes.conflictDiff),
+                });
             }
-            // Run database updates in chunks of 200 via transaction
-            if (jobFileUpdates.length > 0) {
-                const chunkSize = 200;
-                for (let i = 0; i < jobFileUpdates.length; i += chunkSize) {
-                    const chunk = jobFileUpdates.slice(i, i + chunkSize);
-                    await prisma.$transaction(chunk);
+            // Run database updates in chunks of 50 via single-connection transaction with 60s timeout
+            if (applyUpdateItems.length > 0) {
+                const chunkSize = 50;
+                for (let i = 0; i < applyUpdateItems.length; i += chunkSize) {
+                    const chunk = applyUpdateItems.slice(i, i + chunkSize);
+                    await prisma.$transaction(async (tx) => {
+                        for (const item of chunk) {
+                            await tx.syncJobFile.update({
+                                where: { id: item.id },
+                                data: {
+                                    mergeResult: item.mergeResult,
+                                    conflictDiff: item.conflictDiff,
+                                },
+                            });
+                        }
+                    }, { maxWait: 10000, timeout: 60000 });
                 }
             }
             if (hasConflict) {
