@@ -40,28 +40,31 @@ function formatGitError(err: any) {
   return lines.join("\n") || "Unknown git error";
 }
 
-function prepareTargetFilesForPatch(job: any, selectedPaths: string[], targetDir: string) {
-  const baseRef = job.pushEvent.baseSha === "HEAD" ? `${job.pushEvent.commitSha}~1` : job.pushEvent.baseSha;
-
-  for (const filePath of selectedPaths) {
+/**
+ * For files that the client repo doesn't have yet (not in working tree),
+ * directly check out their final commitSha content using `git checkout <sha> -- <path>`.
+ * This places the file in the working tree AND stages it, so it is included in the
+ * commit without needing to go through git-apply (which requires the file to already
+ * be in the index). Returns the list of paths that were successfully placed.
+ */
+function placeFilesFromCommit(
+  missingPaths: string[],
+  commitSha: string,
+  targetDir: string
+): string[] {
+  const placed: string[] = [];
+  for (const filePath of missingPaths) {
     try {
       const safePath = safeRepoPath(filePath);
-      const fullPath = path.join(targetDir, safePath);
-
-      if (!fs.existsSync(fullPath)) {
-        fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-        try {
-          const baseContent = runGit(["show", `${baseRef}:${safePath}`], targetDir);
-          fs.writeFileSync(fullPath, baseContent, "utf8");
-          runGit(["add", safePath], targetDir);
-        } catch {
-          // File did not exist at baseRef in upstream (e.g. brand new file created in commitSha)
-        }
-      }
-    } catch (err) {
-      console.error(`[SyncQueue] Failed to prepare target file ${filePath}:`, err);
+      // git checkout <sha> -- <path> places the file at commitSha into working tree and index
+      runGit(["checkout", commitSha, "--", safePath], targetDir);
+      placed.push(filePath);
+      console.log(`[SyncQueue] Directly placed missing file from commitSha: ${filePath}`);
+    } catch {
+      // File may have been deleted in commitSha, renamed, or another error — skip it
     }
   }
+  return placed;
 }
 
 function sleep(ms: number) {
@@ -101,21 +104,20 @@ function parseUnifiedDiff(diffOutput: string): Map<string, string> {
   return filePatches;
 }
 
-function getSafeSelectedPaths(job: any, selectedPaths: string[], targetDir: string): string[] {
-  const baseShaFiles = new Set<string>();
-  if (job.pushEvent.baseSha !== "HEAD") {
-    try {
-      const lsOutput = runGit(["ls-tree", "-r", "--name-only", job.pushEvent.baseSha], targetDir);
-      lsOutput.split("\n").map(f => f.trim()).filter(Boolean).forEach(f => baseShaFiles.add(f));
-    } catch (lsErr) {
-      console.error("Failed to run git ls-tree:", lsErr);
-    }
-  }
-
+/**
+ * Returns only files that exist in the target working tree.
+ * Files that don't exist in the client repo are handled separately by
+ * placeFilesFromCommit(), which places them directly at their final commitSha
+ * state. This avoids the fragile git ls-tree baseSha approach (which can
+ * silently fail and cause ALL files to bypass the safety filter).
+ */
+function getSafeSelectedPaths(selectedPaths: string[], targetDir: string): string[] {
   return selectedPaths.filter(filePath => {
-    const existedInBase = baseShaFiles.has(filePath);
-    const existsInTarget = fs.existsSync(path.join(targetDir, filePath));
-    return !existedInBase || existsInTarget;
+    try {
+      return fs.existsSync(path.join(targetDir, safeRepoPath(filePath)));
+    } catch {
+      return false;
+    }
   });
 }
 
@@ -329,10 +331,20 @@ class SyncQueue {
         selectedPaths = job.files.map((f: any) => f.filePath);
       }
 
-      prepareTargetFilesForPatch(job, selectedPaths, targetDir);
+      // Separate files into: those that already exist in the client (patchable)
+      // and those that are missing from the client (must be placed directly).
+      const safePaths = getSafeSelectedPaths(selectedPaths, targetDir);
+      const missingPaths = selectedPaths.filter(p => !safePaths.includes(p));
 
+      // Directly place missing files at their final commitSha state.
+      // This avoids "does not exist in index" errors from git apply.
+      if (missingPaths.length > 0) {
+        console.log(`[SyncQueue] Dry-Run: Placing ${missingPaths.length} missing file(s) directly from commitSha.`);
+        placeFilesFromCommit(missingPaths, job.pushEvent.commitSha, targetDir);
+      }
+
+      // Build patch only for files that already exist in the client repo.
       const patchFile = path.join(tempDir, "selected.patch");
-      const safePaths = getSafeSelectedPaths(job, selectedPaths, targetDir);
       let selectedPatch = "";
       if (safePaths.length > 0) {
         selectedPatch = runGit(["diff", "--binary", job.pushEvent.baseSha, job.pushEvent.commitSha, "--", ...safePaths], targetDir);
@@ -766,9 +778,19 @@ class SyncQueue {
       const patchFile = path.join(tempDir, "selected.patch");
       const selectedPaths = job.files.map((f: any) => f.filePath);
 
-      prepareTargetFilesForPatch(job, selectedPaths, targetDir);
+      // Separate files into: those that already exist in the client (patchable)
+      // and those that are missing from the client (must be placed directly).
+      const safePaths = getSafeSelectedPaths(selectedPaths, targetDir);
+      const missingPaths = selectedPaths.filter((p: string) => !safePaths.includes(p));
 
-      const safePaths = getSafeSelectedPaths(job, selectedPaths, targetDir);
+      // Directly place missing files at their final commitSha state.
+      // This avoids "does not exist in index" errors from git apply.
+      if (missingPaths.length > 0) {
+        console.log(`[SyncQueue] Apply: Placing ${missingPaths.length} missing file(s) directly from commitSha.`);
+        placeFilesFromCommit(missingPaths, job.pushEvent.commitSha, targetDir);
+      }
+
+      // Build patch only for files that already exist in the client repo.
       let selectedPatch = "";
       if (safePaths.length > 0) {
         selectedPatch = runGit(["diff", "--binary", job.pushEvent.baseSha, job.pushEvent.commitSha, "--", ...safePaths], targetDir);
