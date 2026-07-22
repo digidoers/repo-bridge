@@ -1323,7 +1323,7 @@ export function PushEventDetailPage() {
                             <div className="max-w-full overflow-hidden rounded-lg border border-border/60 bg-page/20">
                               {displayedFiles.length > 0 ? (
                                 <div className="max-h-[220px] overflow-y-auto overflow-x-hidden p-2 custom-scrollbar">
-                                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-4 xl:grid-cols-5 gap-2">
+                                  <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-2">
                                     {displayedFiles.map((file) => {
                                       const isConflict = file.mergeResult === "CONFLICT";
                                       return (
