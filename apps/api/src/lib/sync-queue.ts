@@ -52,14 +52,20 @@ interface FileSyncResult {
   conflictDiff: string | null;
 }
 
+function sanitizePgText(text: string | null): string | null {
+  if (!text) return null;
+  return text.replace(/\u0000/g, "");
+}
+
 function getFileContentFromRef(ref: string, safePath: string, cwd: string): string | null {
   try {
-    return execFileSync("git", ["show", `${ref}:${safePath}`], {
+    const raw = execFileSync("git", ["show", `${ref}:${safePath}`], {
       cwd,
       encoding: "utf8",
       maxBuffer: 50 * 1024 * 1024,
       stdio: "pipe",
     }) as string;
+    return sanitizePgText(raw);
   } catch {
     return null;
   }
@@ -155,7 +161,7 @@ function syncSingleFile(
       return { mergeResult: "MERGED", conflictDiff: null };
     } catch (mergeErr: any) {
       // Exit status > 0 means git merge-file inserted conflict markers into fullPath
-      const conflictContent = fs.readFileSync(fullPath, "utf8");
+      const conflictContent = sanitizePgText(fs.readFileSync(fullPath, "utf8"));
       return { mergeResult: "CONFLICT", conflictDiff: conflictContent };
     }
   } finally {
@@ -363,7 +369,7 @@ class SyncQueue {
                 prisma.pushFile.update({
                   where: { id: existingId },
                   data: {
-                    patch: filePatch,
+                    patch: sanitizePgText(filePatch),
                     additions: stats.additions,
                     deletions: stats.deletions,
                   }
@@ -376,7 +382,7 @@ class SyncQueue {
                     pushEventId: job.pushEventId,
                     filePath,
                     changeType: "modified",
-                    patch: filePatch,
+                    patch: sanitizePgText(filePatch),
                     additions: stats.additions,
                     deletions: stats.deletions,
                   }
@@ -437,7 +443,7 @@ class SyncQueue {
             where: { id: jobFile.id },
             data: {
               mergeResult: syncRes.mergeResult,
-              conflictDiff: syncRes.conflictDiff,
+              conflictDiff: sanitizePgText(syncRes.conflictDiff),
             },
           })
         );
@@ -860,7 +866,7 @@ class SyncQueue {
             where: { id: jobFile.id },
             data: {
               mergeResult: syncRes.mergeResult,
-              conflictDiff: syncRes.conflictDiff,
+              conflictDiff: sanitizePgText(syncRes.conflictDiff),
             },
           })
         );
