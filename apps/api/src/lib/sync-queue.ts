@@ -27,9 +27,41 @@ function safeRepoPath(value: string) {
 }
 
 function formatGitError(err: any) {
-  const stderr = err?.stderr?.toString?.().trim();
-  const stdout = err?.stdout?.toString?.().trim();
-  return stderr || stdout || err?.message || "Unknown git error";
+  const stderr = err?.stderr?.toString?.() || "";
+  const stdout = err?.stdout?.toString?.() || "";
+  const message = err?.message || "";
+  const combined = `${stderr}\n${stdout}\n${message}`.trim();
+
+  const lines = combined
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.includes(": trailing whitespace."));
+
+  return lines.join("\n") || "Unknown git error";
+}
+
+function prepareTargetFilesForPatch(job: any, selectedPaths: string[], targetDir: string) {
+  const baseRef = job.pushEvent.baseSha === "HEAD" ? `${job.pushEvent.commitSha}~1` : job.pushEvent.baseSha;
+
+  for (const filePath of selectedPaths) {
+    try {
+      const safePath = safeRepoPath(filePath);
+      const fullPath = path.join(targetDir, safePath);
+
+      if (!fs.existsSync(fullPath)) {
+        fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+        try {
+          const baseContent = runGit(["show", `${baseRef}:${safePath}`], targetDir);
+          fs.writeFileSync(fullPath, baseContent, "utf8");
+          runGit(["add", safePath], targetDir);
+        } catch {
+          // File did not exist at baseRef in upstream (e.g. brand new file created in commitSha)
+        }
+      }
+    } catch (err) {
+      console.error(`[SyncQueue] Failed to prepare target file ${filePath}:`, err);
+    }
+  }
 }
 
 function sleep(ms: number) {
@@ -297,6 +329,8 @@ class SyncQueue {
         selectedPaths = job.files.map((f: any) => f.filePath);
       }
 
+      prepareTargetFilesForPatch(job, selectedPaths, targetDir);
+
       const patchFile = path.join(tempDir, "selected.patch");
       const safePaths = getSafeSelectedPaths(job, selectedPaths, targetDir);
       let selectedPatch = "";
@@ -325,7 +359,7 @@ class SyncQueue {
 
       // 7. Simulate the exact apply operation used by real merge.
       try {
-        runGit(["apply", "--3way", patchFile], targetDir);
+        runGit(["apply", "--3way", "--whitespace=nowarn", patchFile], targetDir);
       } catch (applyErr) {
         // Ignore here; conflict markers in the temp worktree are inspected below.
       }
@@ -731,6 +765,9 @@ class SyncQueue {
       // 5. Build patch file for selected files only
       const patchFile = path.join(tempDir, "selected.patch");
       const selectedPaths = job.files.map((f: any) => f.filePath);
+
+      prepareTargetFilesForPatch(job, selectedPaths, targetDir);
+
       const safePaths = getSafeSelectedPaths(job, selectedPaths, targetDir);
       let selectedPatch = "";
       if (safePaths.length > 0) {
@@ -777,7 +814,7 @@ class SyncQueue {
       // 7. Apply patch. If the user saved conflict resolutions, those files
       // override the patch result before we stage and commit.
       try {
-        runGit(["apply", "--3way", patchFile], targetDir);
+        runGit(["apply", "--3way", "--whitespace=nowarn", patchFile], targetDir);
         this.applySavedResolvedFiles(job, targetDir);
         runGit(["add", "-A"], targetDir);
       } catch (applyErr) {
