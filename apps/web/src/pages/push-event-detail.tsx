@@ -393,6 +393,31 @@ export function PushEventDetailPage() {
     },
   });
 
+  const bulkResolveMutation = useMutation({
+    mutationFn: (data: { jobId: string; resolutions: Array<{ filePath: string; resolvedContent: string }> }) =>
+      api.bulkResolveSyncJobConflicts(data.jobId, data.resolutions),
+    onSuccess: () => {
+      toast.success("Bulk conflict resolutions saved.");
+      refetchSyncJobs();
+    },
+    onError: (err: any) => {
+      toast.error(err.message || "Failed to bulk resolve conflicts");
+    },
+  });
+
+  const resetConflictMutation = useMutation({
+    mutationFn: (data: { jobId: string; filePath: string }) =>
+      api.resetSyncJobConflict(data.jobId, data.filePath),
+    onSuccess: () => {
+      toast.success("File reset back to conflict status.");
+      if (resolutionDraft) setResolutionDraft(null);
+      refetchSyncJobs();
+    },
+    onError: (err: any) => {
+      toast.error(err.message || "Failed to reset file conflict");
+    },
+  });
+
   // Mutation: merge clean sync jobs
   const applySyncJobsMutation = useMutation({
     mutationFn: async () => {
@@ -526,6 +551,60 @@ export function PushEventDetailPage() {
       filesByRepo: {
         [job.targetRepoId]: updatedSelected,
       },
+    });
+  };
+
+  const [selectedConflictFilePaths, setSelectedConflictFilePaths] = useState<Record<string, string[]>>({});
+
+  const handleToggleSingleConflictFile = (jobId: string, filePath: string) => {
+    const current = selectedConflictFilePaths[jobId] || [];
+    if (current.includes(filePath)) {
+      setSelectedConflictFilePaths({
+        ...selectedConflictFilePaths,
+        [jobId]: current.filter((x) => x !== filePath),
+      });
+    } else {
+      setSelectedConflictFilePaths({
+        ...selectedConflictFilePaths,
+        [jobId]: [...current, filePath],
+      });
+    }
+  };
+
+  const handleToggleAllConflictsForJob = (job: SyncJob, allConflictFilePaths: string[]) => {
+    const current = selectedConflictFilePaths[job.id] || [];
+    if (current.length === allConflictFilePaths.length) {
+      setSelectedConflictFilePaths({
+        ...selectedConflictFilePaths,
+        [job.id]: [],
+      });
+    } else {
+      setSelectedConflictFilePaths({
+        ...selectedConflictFilePaths,
+        [job.id]: [...allConflictFilePaths],
+      });
+    }
+  };
+
+  const handleBulkResolve = (job: SyncJob, choice: "current" | "incoming" | "both") => {
+    const jobSelectedFiles = selectedConflictFilePaths[job.id] || [];
+    const conflictFiles = (job.files || []).filter(
+      (f) => f.mergeResult === "CONFLICT" && f.conflictDiff && jobSelectedFiles.includes(f.filePath)
+    );
+
+    if (conflictFiles.length === 0) {
+      toast.error("Select at least one conflict file using the checkboxes.");
+      return;
+    }
+
+    const resolutions = conflictFiles.map((file) => ({
+      filePath: file.filePath,
+      resolvedContent: applyConflictChoice(file.conflictDiff || "", choice),
+    }));
+
+    bulkResolveMutation.mutate({
+      jobId: job.id,
+      resolutions,
     });
   };
 
@@ -1437,7 +1516,7 @@ export function PushEventDetailPage() {
                                             </span>
                                           </div>
 
-                                          {isConflict && (
+                                          {isConflict ? (
                                             <div className="flex flex-wrap items-center gap-2 mt-0.5 pt-1 border-t border-warning/30 text-[10px]">
                                               <button
                                                 onClick={() => openResolutionEditor(job, file.filePath, file.conflictDiff)}
@@ -1452,6 +1531,18 @@ export function PushEventDetailPage() {
                                                 Exclude & retry
                                               </button>
                                             </div>
+                                          ) : (
+                                            (file.mergeResult === "MERGED" || file.conflictDiff?.startsWith("repo-sync:resolved-content:v1\n")) && (
+                                              <div className="flex flex-wrap items-center gap-2 mt-0.5 pt-1 border-t border-accent/20 text-[10px]">
+                                                <button
+                                                  onClick={() => resetConflictMutation.mutate({ jobId: job.id, filePath: file.filePath })}
+                                                  disabled={resetConflictMutation.isPending}
+                                                  className="font-semibold text-warning hover:underline flex items-center gap-0.5"
+                                                >
+                                                  Reset to conflict
+                                                </button>
+                                              </div>
+                                            )
                                           )}
                                         </div>
                                       );
@@ -1480,7 +1571,7 @@ export function PushEventDetailPage() {
                         );
                       })()}
 
-                        {/* Conflict Diff Box - Accordion / On-Demand Preview */}
+                        {/* Conflict Diff Box - Bulk Action Toolbar & Accordion Previews */}
                         {(() => {
                           const conflictFiles = (job.files || []).filter(
                             (file) => file.mergeResult === "CONFLICT" && file.conflictDiff
@@ -1488,9 +1579,63 @@ export function PushEventDetailPage() {
                           if (conflictFiles.length === 0) return null;
 
                           const allExpanded = conflictFiles.every((f) => expandedConflictFileIds[f.id]);
+                          const jobSelectedFilePaths = selectedConflictFilePaths[job.id] || [];
+                          const isAllConflictsSelected =
+                            conflictFiles.length > 0 &&
+                            conflictFiles.every((f) => jobSelectedFilePaths.includes(f.filePath));
 
                           return (
-                            <div className="space-y-2 pt-3 border-t border-warning/20">
+                            <div className="space-y-3 pt-3 border-t border-warning/20">
+                              {/* Bulk Conflict Action Toolbar */}
+                              <div className="bg-warning/10 border border-warning/30 rounded-xl p-3 space-y-2">
+                                <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+                                  <label className="flex items-center gap-2 text-xs font-semibold text-warning cursor-pointer select-none">
+                                    <input
+                                      type="checkbox"
+                                      checked={isAllConflictsSelected}
+                                      onChange={() =>
+                                        handleToggleAllConflictsForJob(
+                                          job,
+                                          conflictFiles.map((f) => f.filePath)
+                                        )
+                                      }
+                                      className="w-4 h-4 rounded border-warning/50 text-warning focus:ring-warning cursor-pointer"
+                                    />
+                                    <span>
+                                      Select All Conflicts ({jobSelectedFilePaths.length} / {conflictFiles.length} selected)
+                                    </span>
+                                  </label>
+
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <Button
+                                      type="button"
+                                      onClick={() => handleBulkResolve(job, "current")}
+                                      disabled={jobSelectedFilePaths.length === 0 || bulkResolveMutation.isPending}
+                                      className="text-3xs h-7 bg-red-500/20 hover:bg-red-500/30 text-red-300 border border-red-500/30 font-semibold"
+                                    >
+                                      Bulk Accept Target ({job.targetRepo?.customerName || job.targetRepo?.githubName || "target"})
+                                    </Button>
+                                    <Button
+                                      type="button"
+                                      onClick={() => handleBulkResolve(job, "incoming")}
+                                      disabled={jobSelectedFilePaths.length === 0 || bulkResolveMutation.isPending}
+                                      className="text-3xs h-7 bg-blue-500/20 hover:bg-blue-500/30 text-blue-300 border border-blue-500/30 font-semibold"
+                                    >
+                                      Bulk Accept Source ({event?.repository?.githubName || "source"})
+                                    </Button>
+                                    <Button
+                                      type="button"
+                                      onClick={() => handleBulkResolve(job, "both")}
+                                      disabled={jobSelectedFilePaths.length === 0 || bulkResolveMutation.isPending}
+                                      variant="secondary"
+                                      className="text-3xs h-7"
+                                    >
+                                      Bulk Keep Both
+                                    </Button>
+                                  </div>
+                                </div>
+                              </div>
+
                               <div className="flex items-center justify-between">
                                 <h4 className="text-2xs font-bold text-warning uppercase tracking-wider flex items-center gap-1.5">
                                   <AlertTriangle className="w-3.5 h-3.5" />
@@ -1515,6 +1660,7 @@ export function PushEventDetailPage() {
 
                               {conflictFiles.map((file) => {
                                 const isExpanded = Boolean(expandedConflictFileIds[file.id]);
+                                const isChecked = jobSelectedFilePaths.includes(file.filePath);
                                 const targetLabel = `${job.targetRepo?.fullName || "target"}:${job.targetRepo?.branch || "branch"}`;
                                 const sourceLabel = `${event?.repository?.fullName || "main"}:${event?.branch || "branch"}`;
 
@@ -1524,7 +1670,13 @@ export function PushEventDetailPage() {
                                     className="border border-warning/30 rounded-lg overflow-hidden bg-page/40"
                                   >
                                     <div className="px-3.5 py-2 bg-warning/10 border-b border-warning/20 text-warning text-xs font-semibold flex items-center justify-between gap-2">
-                                      <div className="flex items-center gap-1.5 truncate">
+                                      <div className="flex items-center gap-2 truncate">
+                                        <input
+                                          type="checkbox"
+                                          checked={isChecked}
+                                          onChange={() => handleToggleSingleConflictFile(job.id, file.filePath)}
+                                          className="w-4 h-4 rounded border-warning/50 text-warning focus:ring-warning cursor-pointer flex-shrink-0"
+                                        />
                                         <AlertTriangle className="w-4 h-4 flex-shrink-0" />
                                         <span className="truncate">Conflict in {file.filePath}</span>
                                       </div>
@@ -1714,6 +1866,27 @@ export function PushEventDetailPage() {
                 This only saves the file resolution. Merge after every conflicted file is saved.
               </p>
               <div className="flex items-center gap-2">
+                <Button
+                  type="button"
+                  variant="secondary"
+                  onClick={() => {
+                    resetConflictMutation.mutate({
+                      jobId: resolutionDraft.jobId,
+                      filePath: resolutionDraft.filePath,
+                    });
+                  }}
+                  disabled={resetConflictMutation.isPending}
+                  className="text-xs border-warning/30 hover:border-warning/50 text-warning hover:bg-warning/10"
+                >
+                  {resetConflictMutation.isPending ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      Resetting...
+                    </>
+                  ) : (
+                    "Mark as Conflict"
+                  )}
+                </Button>
                 <Button
                   type="button"
                   variant="secondary"

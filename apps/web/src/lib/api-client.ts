@@ -296,6 +296,26 @@ class ApiClient {
     });
   }
 
+  async bulkResolveSyncJobConflicts(
+    id: string,
+    resolutions: Array<{ filePath: string; resolvedContent: string }>
+  ): Promise<SyncJob> {
+    return this.request<SyncJob>(`/sync-jobs/${id}/bulk-resolve-conflicts`, {
+      method: "POST",
+      body: JSON.stringify({ resolutions }),
+    });
+  }
+
+  async resetSyncJobConflict(
+    id: string,
+    filePath: string
+  ): Promise<SyncJob> {
+    return this.request<SyncJob>(`/sync-jobs/${id}/reset-conflict`, {
+      method: "POST",
+      body: JSON.stringify({ filePath }),
+    });
+  }
+
   async applySyncJobs(
     pushEventId: string,
     syncJobIds: string[],

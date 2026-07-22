@@ -11,6 +11,11 @@ declare class SyncQueue {
     private runRealDryRun;
     enqueueApply(syncJobId: string, options?: ApplyOptions): void;
     resolveConflictFile(syncJobId: string, filePath: string, resolvedContent: string): Promise<void>;
+    bulkResolveConflictFiles(syncJobId: string, filePaths: string[], resolutions: Array<{
+        filePath: string;
+        resolvedContent: string;
+    }>): Promise<void>;
+    resetConflictFile(syncJobId: string, filePath: string): Promise<void>;
     private processApply;
     private checkPushEventCompletion;
     private mergeExistingPullRequest;

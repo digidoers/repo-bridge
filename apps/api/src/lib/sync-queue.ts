@@ -425,6 +425,11 @@ class SyncQueue {
       const jobFileUpdates = [];
 
       for (const jobFile of job.files) {
+        // Preserve user-saved resolutions across dry-run passes
+        if (jobFile.conflictDiff && jobFile.conflictDiff.startsWith(RESOLVED_CONTENT_PREFIX)) {
+          continue;
+        }
+
         const syncRes = syncSingleFile(
           jobFile.filePath,
           baseRef,
@@ -458,21 +463,29 @@ class SyncQueue {
         }
       }
 
+      const updatedJobFiles = await prisma.syncJobFile.findMany({
+        where: { syncJobId: job.id },
+      });
+      const remainingConflictsCount = updatedJobFiles.filter((f) => f.mergeResult === "CONFLICT").length;
+      const finalStatus = remainingConflictsCount > 0 ? "CONFLICT" : "CLEAN";
+
       await prisma.syncJob.update({
-        where: { id: jobId },
+        where: { id: job.id },
         data: {
-          status: hasConflict ? "CONFLICT" : "CLEAN",
+          status: finalStatus,
+          errorMessage: finalStatus === "CONFLICT" ? `${remainingConflictsCount} file(s) require conflict triage.` : null,
         },
       });
 
-      console.log(`[SyncQueue] Real Dry-Run finished for SyncJob ${jobId}. Status: ${hasConflict ? "CONFLICT" : "CLEAN"}`);
+      console.log(`[SyncQueue] Dry-Run completed for SyncJob ${job.id} with status ${finalStatus}`);
+    } catch (err: any) {
+      console.error(`[SyncQueue] Error during dry-run for SyncJob ${job.id}:`, err);
+      throw err;
     } finally {
-      // 8. Clean up temporary directory
+      // Clean up temp directory
       try {
         fs.rmSync(tempDir, { recursive: true, force: true });
-      } catch (rmErr) {
-        console.error(`[SyncQueue] Failed to clean up ${tempDir}:`, rmErr);
-      }
+      } catch (e) {}
     }
   }
 
@@ -506,8 +519,8 @@ class SyncQueue {
         throw new Error(`Only conflicted jobs can be resolved. Current status is ${job.status}.`);
       }
 
-      if (!job.files.some((file: any) => file.filePath === filePath && file.mergeResult === "CONFLICT")) {
-        throw new Error("Selected file is not marked as a conflict for this sync job.");
+      if (!job.files.some((file: any) => file.filePath === filePath && (file.mergeResult === "CONFLICT" || file.mergeResult === "MERGED"))) {
+        throw new Error("Selected file is not part of this sync job.");
       }
 
       if (await GithubAppService.isMockMode()) {
@@ -536,7 +549,148 @@ class SyncQueue {
         where: { id: syncJobId },
         data: {
           status: remainingConflicts > 0 ? "CONFLICT" : "CLEAN",
-          errorMessage: null,
+          errorMessage: remainingConflicts > 0 ? `${remainingConflicts} file(s) require conflict triage.` : null,
+        },
+      });
+    } catch (err: any) {
+      throw err;
+    }
+  }
+
+  public async bulkResolveConflictFiles(
+    syncJobId: string,
+    filePaths: string[],
+    resolutions: Array<{ filePath: string; resolvedContent: string }>
+  ) {
+    try {
+      const job = await prisma.syncJob.findUnique({
+        where: { id: syncJobId },
+        include: { files: true },
+      });
+
+      if (!job) {
+        throw new Error("Sync job not found");
+      }
+
+      const updates = resolutions.map((res) =>
+        prisma.syncJobFile.updateMany({
+          where: {
+            syncJobId,
+            filePath: res.filePath,
+          },
+          data: {
+            mergeResult: "MERGED",
+            conflictDiff: `${RESOLVED_CONTENT_PREFIX}${res.resolvedContent}`,
+          },
+        })
+      );
+
+      if (updates.length > 0) {
+        const chunkSize = 200;
+        for (let i = 0; i < updates.length; i += chunkSize) {
+          const chunk = updates.slice(i, i + chunkSize);
+          await prisma.$transaction(chunk);
+        }
+      }
+
+      const remainingConflicts = await prisma.syncJobFile.count({
+        where: {
+          syncJobId,
+          mergeResult: "CONFLICT",
+        },
+      });
+
+      await prisma.syncJob.update({
+        where: { id: syncJobId },
+        data: {
+          status: remainingConflicts > 0 ? "CONFLICT" : "CLEAN",
+          errorMessage: remainingConflicts > 0 ? `${remainingConflicts} file(s) require conflict triage.` : null,
+        },
+      });
+    } catch (err: any) {
+      throw err;
+    }
+  }
+
+  public async resetConflictFile(syncJobId: string, filePath: string) {
+    try {
+      const job = await prisma.syncJob.findUnique({
+        where: { id: syncJobId },
+        include: {
+          pushEvent: { include: { repository: true } },
+          targetRepo: true,
+          files: true,
+        },
+      });
+
+      if (!job) {
+        throw new Error("Sync job not found");
+      }
+
+      const tempDir = path.join(process.cwd(), "temp-jobs", `reset-${Date.now()}`);
+      fs.mkdirSync(tempDir, { recursive: true });
+
+      try {
+        const targetDir = path.join(tempDir, "target");
+        const targetRepo = job.targetRepo;
+        const mainRepo = job.pushEvent.repository;
+
+        const targetToken = await GithubAppService.getInstallationToken(targetRepo.installationId);
+        const mainToken = await GithubAppService.getInstallationToken(mainRepo.installationId);
+
+        const targetUrl = `https://x-access-token:${targetToken}@github.com/${targetRepo.fullName}.git`;
+        runGit(["clone", "--branch", targetRepo.branch, "--depth", "50", targetUrl, "target"], tempDir, { stdio: "ignore" });
+
+        const mainUrl = `https://x-access-token:${mainToken}@github.com/${mainRepo.fullName}.git`;
+        runGit(["remote", "add", "upstream", mainUrl], targetDir);
+
+        const fetchArgs = ["fetch", "upstream"];
+        if (job.pushEvent.baseSha !== "HEAD") {
+          fetchArgs.push(job.pushEvent.baseSha);
+        }
+        fetchArgs.push(job.pushEvent.commitSha);
+        runGit(fetchArgs, targetDir, { stdio: "ignore" });
+
+        runGit(["checkout", "-b", `reset-check`], targetDir);
+
+        const baseRef = job.pushEvent.baseSha === "HEAD" ? `${job.pushEvent.commitSha}~1` : job.pushEvent.baseSha;
+        const syncRes = syncSingleFile(
+          filePath,
+          baseRef,
+          job.pushEvent.commitSha,
+          targetDir,
+          tempDir,
+          true
+        );
+
+        await prisma.syncJobFile.updateMany({
+          where: {
+            syncJobId,
+            filePath,
+          },
+          data: {
+            mergeResult: syncRes.mergeResult || "CONFLICT",
+            conflictDiff: sanitizePgText(syncRes.conflictDiff),
+          },
+        });
+      } finally {
+        try {
+          fs.rmSync(tempDir, { recursive: true, force: true });
+        } catch (e) {}
+      }
+
+      const remainingConflicts = await prisma.syncJobFile.count({
+        where: {
+          syncJobId,
+          mergeResult: "CONFLICT",
+        },
+      });
+
+      await prisma.syncJob.update({
+        where: { id: syncJobId },
+        data: {
+          status: "CONFLICT",
+          errorMessage: `${remainingConflicts} file(s) require conflict triage.`,
         },
       });
     } catch (err: any) {

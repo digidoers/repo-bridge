@@ -661,6 +661,105 @@ syncJobsRouter.post("/sync-jobs/:id/resolve-conflict", async (req: Request, res:
 });
 
 /**
+ * POST /sync-jobs/:id/bulk-resolve-conflicts
+ * Saves resolutions for multiple conflicted files simultaneously.
+ */
+syncJobsRouter.post("/sync-jobs/:id/bulk-resolve-conflicts", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = req.params.id as string;
+    const { resolutions } = req.body as {
+      resolutions?: Array<{ filePath: string; resolvedContent: string }>;
+    };
+
+    if (!Array.isArray(resolutions) || resolutions.length === 0) {
+      return next(AppError.badRequest("resolutions must be a non-empty array"));
+    }
+
+    const ownedSyncJob = await prisma.syncJob.findFirst({
+      where: {
+        id,
+        pushEvent: {
+          repository: {
+            userId: req.user!.id,
+          },
+        },
+      },
+      select: { id: true },
+    });
+
+    if (!ownedSyncJob) {
+      return next(AppError.notFound("Sync job not found"));
+    }
+
+    const filePaths = resolutions.map((r) => r.filePath);
+    await syncQueue.bulkResolveConflictFiles(id, filePaths, resolutions);
+
+    const updatedSyncJob = await prisma.syncJob.findFirst({
+      where: { id },
+      include: {
+        targetRepo: true,
+        files: true,
+      },
+    });
+
+    res.json({
+      ok: true,
+      data: updatedSyncJob,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /sync-jobs/:id/reset-conflict
+ * Resets a file back to CONFLICT status with its original conflict markers.
+ */
+syncJobsRouter.post("/sync-jobs/:id/reset-conflict", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const id = req.params.id as string;
+    const { filePath } = req.body as { filePath?: string };
+
+    if (!filePath || typeof filePath !== "string") {
+      return next(AppError.badRequest("filePath is required"));
+    }
+
+    const ownedSyncJob = await prisma.syncJob.findFirst({
+      where: {
+        id,
+        pushEvent: {
+          repository: {
+            userId: req.user!.id,
+          },
+        },
+      },
+      select: { id: true },
+    });
+
+    if (!ownedSyncJob) {
+      return next(AppError.notFound("Sync job not found"));
+    }
+
+    await syncQueue.resetConflictFile(id, filePath);
+
+    const updatedSyncJob = await prisma.syncJob.findFirst({
+      where: { id },
+      include: {
+        targetRepo: true,
+        files: true,
+      },
+    });
+
+    res.json({
+      ok: true,
+      data: updatedSyncJob,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
  * POST /push-events/:id/apply
  * Merges a list of CLEAN SyncJobs in the background.
  */
